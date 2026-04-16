@@ -1,0 +1,197 @@
+name: Build and Deploy Packages
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      mock_build:
+        description: "Skip the VM build; generate fake packages to test the deploy path"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  generate-matrix:
+    name: Generate build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate matrix
+        id: matrix
+        run: |
+          matrix=$(sh scripts/generate-matrix.sh)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.binmiscctl_name }} (FreeBSD ${{ matrix.freebsd_version }})
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Shortcut for iterating on the deploy path: manually dispatch the
+      # workflow with mock_build=true. A handful of empty .pkg files plus
+      # the expected metadata filenames are generated so the rest of the
+      # pipeline (prepare tarball, upload-artifact, download-artifact,
+      # extract, upload-pages-artifact, deploy-pages) runs against a
+      # realistic `packages/` shape without waiting hours for the real VM.
+      - name: Mock build -- generate fake packages
+        if: ${{ inputs.mock_build }}
+        run: |
+          mkdir -p packages/All packages/Latest
+          for p in bash-5.3.9 sudo-1.9.17p2_2 curl-8.19.0_2 rsync-3.4.1_7 pkg-2.7.4; do
+              : > "packages/All/${p}.pkg"
+          done
+          : > packages/Latest/pkg.pkg
+          : > packages/meta.conf
+          : > packages/meta
+          : > packages/data.pkg
+          : > packages/packagesite.pkg
+
+      # Restore previously-built packages. A unique key per run means save
+      # always succeeds; the restore-keys prefix falls back to the most
+      # recent cache for this jail. Progressive runs converge to a full
+      # build under the 6-hour job limit.
+      - name: Restore packages cache
+        id: cache-restore
+        if: ${{ !inputs.mock_build }}
+        uses: actions/cache/restore@v4
+        with:
+          path: packages
+          key: packages-${{ matrix.jail_name }}-${{ github.run_id }}
+          restore-keys: |
+            packages-${{ matrix.jail_name }}-
+
+      - name: Build packages in FreeBSD VM
+        if: ${{ !inputs.mock_build }}
+        # Leaves ~20 minutes for cache save before the 6-hour job timeout.
+        timeout-minutes: 340
+        uses: cross-platform-actions/action@v1.0.0
+        env:
+          POUDRIERE_ARCH: ${{ matrix.poudriere_arch }}
+          BINMISCCTL_NAME: ${{ matrix.binmiscctl_name }}
+          QEMU_BINARY: ${{ matrix.qemu_binary }}
+          ELF_MAGIC: ${{ matrix.elf_magic }}
+          ELF_MASK: ${{ matrix.elf_mask }}
+          FREEBSD_VERSION: ${{ matrix.freebsd_version }}
+          JAIL_NAME: ${{ matrix.jail_name }}
+        with:
+          operating_system: freebsd
+          version: '15.0'
+          # Conservative values -- the runner has 4 vCPU / 16 GB, but pushing
+          # higher triggered OOM-style cascade failures across parallel
+          # builders (USE_TMPFS=wrkdir + ALLOW_MAKE_JOBS compound the pressure).
+          memory: 6G
+          cpu_count: 2
+          shell: sh
+          sync_files: true
+          # Skip graceful VM shutdown -- files are already synced back before
+          # post-run, and termination is faster and avoids known teardown
+          # freezes.
+          shutdown_vm: false
+          environment_variables: POUDRIERE_ARCH BINMISCCTL_NAME QEMU_BINARY ELF_MAGIC ELF_MASK FREEBSD_VERSION JAIL_NAME
+          run: sh scripts/build-packages.sh
+
+      # cross-platform-actions' rsync sync-back does not --delete, so any
+      # stale content that a dirty cache restored onto the runner survives
+      # even after collect-packages.sh cleans it inside the VM. Prune the
+      # workspace packages/ down to the same public subset here so the
+      # cache and the artifact tarball stay clean.
+      - name: Prune packages/ to public subset
+        if: ${{ always() && !inputs.mock_build }}
+        run: |
+          if [ -d packages ]; then
+              find packages -mindepth 1 -maxdepth 1 \
+                  ! -name All \
+                  ! -name Latest \
+                  ! -name meta.conf \
+                  ! -name meta \
+                  ! -name data.pkg \
+                  ! -name packagesite.pkg \
+                  -exec rm -rf {} +
+          fi
+
+      # Always save, even on timeout or failure, so partial progress is
+      # preserved. always() covers success, failure, and cancellation.
+      # Skipped for mock builds so they don't pollute the real cache.
+      - name: Save packages cache
+        if: ${{ always() && !inputs.mock_build }}
+        uses: actions/cache/save@v5
+        with:
+          path: packages
+          key: packages-${{ matrix.jail_name }}-${{ github.run_id }}
+
+      # Tarball the site directory. actions/upload-artifact rejects paths
+      # containing colons (Windows filesystem compat), but pkg clients
+      # require ABI paths like FreeBSD:15:riscv64. The final pages artifact
+      # is itself a tarball and does preserve colons, so we only need to
+      # work around the intermediate upload/download step.
+      - name: Prepare site tarball
+        run: |
+          abi_dir="FreeBSD:${{ matrix.major_version }}:${{ matrix.binmiscctl_name }}"
+          mkdir -p "_site/$abi_dir"
+          cp -R packages/. "_site/$abi_dir/"
+          tar -C _site -czf site.tar.gz .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: site-${{ matrix.binmiscctl_name }}-${{ matrix.freebsd_version }}
+          path: site.tar.gz
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: site-*
+
+      - name: Extract tarballs into _site
+        run: sh scripts/deploy/extract-artifacts.sh
+
+      - name: Generate landing page
+        env:
+          BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: sh scripts/deploy/generate-landing-page.sh
+
+      - name: Generate directory indexes
+        run: sh scripts/deploy/generate-directory-indexes.sh
+
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -13,11 +13,9 @@ The packages are built with [poudriere] using [QEMU user-mode emulation] and
 
 ## Supported targets
 
-| Architecture     | FreeBSD version |
-|------------------|-----------------|
-| powerpc64        | 15.0            |
-| powerpc64le      | 15.0            |
-| powerpc64elfv1   | 15.0            |
+| Architecture | FreeBSD version |
+|--------------|-----------------|
+| powerpc64    | 15.0            |
 
 ## Using the repository
 
@@ -31,7 +29,6 @@ custom: {
 }
 ```
 
-Replace `powerpc64` with `powerpc64le` or `powerpc64elfv1` for those ABIs.
 
 Then:
 

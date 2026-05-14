@@ -25,6 +25,10 @@ sudo -E sh "$SCRIPT_DIR/setup-emulation.sh"
 # Step 2: Install and configure poudriere, create jail and ports tree
 sudo -E sh "$SCRIPT_DIR/setup-poudriere.sh"
 
+# Step 2.5: Dump emulation diagnostics. Non-fatal -- we want to see what's
+# happening even if some probes fail.
+sudo -E sh "$SCRIPT_DIR/diagnose-emulation.sh" || true
+
 # Step 3: Pre-seed poudriere's package dir from the restored cache, if any.
 # poudriere bulk checks existing packages against current port definitions
 # and reuses anything still valid -- so progressive runs resume where the

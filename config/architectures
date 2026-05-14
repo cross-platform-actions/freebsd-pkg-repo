@@ -1,3 +1,1 @@
 powerpc.powerpc64 powerpc64 qemu-ppc64-static 7f454c4602020100000000000000000000020015 ffffffffffffff00fffffffffffffffffffeffff -cpu power9
-powerpc.powerpc64le powerpc64le qemu-ppc64le-static 7f454c4602010100000000000000000002001500 ffffffffffffff00fffffffffffffffffeffffff -cpu power9
-powerpc.powerpc64elfv1 powerpc64elfv1 qemu-ppc64-static 7f454c4602020100000000000000000000020015 ffffffffffffff00fffffffffffffffffffeffff -cpu power9

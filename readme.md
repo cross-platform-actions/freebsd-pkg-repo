@@ -16,6 +16,7 @@ The packages are built with [poudriere] using [QEMU user-mode emulation] and
 | Architecture | FreeBSD version |
 |--------------|-----------------|
 | riscv64      | 15.0            |
+| powerpc64    | 15.0            |
 
 ## Using the repository
 

@@ -1,1 +1,1 @@
-riscv.riscv64 riscv64 qemu-riscv64-static 7f454c460201010000000000000000000200f300 ffffffffffffff00fffffffffffffffffeffffff
+powerpc.powerpc64 powerpc64 qemu-ppc64-static 7f454c4602020100000000000000000000020015 ffffffffffffff00fffffffffffffffffffeffff

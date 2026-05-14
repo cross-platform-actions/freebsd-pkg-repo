@@ -16,6 +16,7 @@
 
 JAIL_DIR="/usr/local/poudriere/jails/${JAIL_NAME}"
 TARGET_BIN="${JAIL_DIR}/usr/bin/id"
+QEMU="/usr/local/bin/${QEMU_BINARY}"
 
 echo "==== binmiscctl list ===="
 binmiscctl list
@@ -29,9 +30,14 @@ echo "==== qemu-user-static package contents (ppc/powerpc) ===="
 pkg info -l qemu-user-static 2>/dev/null | grep -Ei 'ppc|powerpc'
 echo
 
-echo "==== /usr/local/bin/${QEMU_BINARY} ===="
-ls -l "/usr/local/bin/${QEMU_BINARY}"
-file "/usr/local/bin/${QEMU_BINARY}"
+echo "==== ${QEMU} ===="
+ls -l "${QEMU}"
+file "${QEMU}"
+echo
+
+echo "==== ${QEMU} --version ===="
+# shellcheck disable=SC2086
+"${QEMU}" ${QEMU_ARGS} --version
 echo
 
 echo "==== file ${TARGET_BIN} ===="
@@ -42,12 +48,30 @@ echo "==== first 64 bytes of ${TARGET_BIN} ===="
 hexdump -C -n 64 "${TARGET_BIN}"
 echo
 
-echo "==== direct invocation: qemu ${QEMU_ARGS} ${TARGET_BIN} ===="
+echo "==== TEST A: direct qemu, no -L (expected to fail: host ld-elf is amd64) ===="
 # shellcheck disable=SC2086
-"/usr/local/bin/${QEMU_BINARY}" ${QEMU_ARGS} "${TARGET_BIN}"
-echo "qemu exit: $?"
+"${QEMU}" ${QEMU_ARGS} "${TARGET_BIN}"
+echo "exit: $?"
 echo
 
-echo "==== invocation via binmiscctl (chroot to jail base) ===="
+echo "==== TEST B: direct qemu, -L ${JAIL_DIR} (qemu resolves libs in jail) ===="
+# shellcheck disable=SC2086
+"${QEMU}" ${QEMU_ARGS} -L "${JAIL_DIR}" "${TARGET_BIN}"
+echo "exit: $?"
+echo
+
+echo "==== TEST C: chroot + manual qemu invocation (mirrors binmiscctl path) ===="
+# Copy qemu into the jail tree so it's reachable post-chroot, then run
+# it explicitly (not via binmiscctl) inside the chroot. If this works
+# but TEST D fails, the bug is in the binmiscctl path. If this fails
+# too, qemu itself can't run dyn-linked FreeBSD/PPC64 binaries.
+cp "${QEMU}" "${JAIL_DIR}/usr/local/bin/${QEMU_BINARY}" 2>/dev/null || \
+    { mkdir -p "${JAIL_DIR}/usr/local/bin" && cp "${QEMU}" "${JAIL_DIR}/usr/local/bin/${QEMU_BINARY}"; }
+# shellcheck disable=SC2086
+chroot "${JAIL_DIR}" "/usr/local/bin/${QEMU_BINARY}" ${QEMU_ARGS} /usr/bin/id
+echo "exit: $?"
+echo
+
+echo "==== TEST D: chroot + implicit binmiscctl dispatch ===="
 chroot "${JAIL_DIR}" /usr/bin/id
-echo "chroot+id exit: $?"
+echo "exit: $?"

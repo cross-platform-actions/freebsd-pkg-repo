@@ -9,6 +9,10 @@
 #   ELF_MASK        - ELF mask bytes in hex
 #   FREEBSD_VERSION - e.g. 15.0
 #   JAIL_NAME       - e.g. riscv64-150
+#
+# Optional:
+#   QEMU_ARGS       - extra arguments to the qemu interpreter (e.g.
+#                     "-cpu power9"). May be empty.
 
 set -eux
 

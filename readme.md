@@ -13,22 +13,25 @@ The packages are built with [poudriere] using [QEMU user-mode emulation] and
 
 ## Supported targets
 
-| Architecture | FreeBSD version |
-|--------------|-----------------|
-| riscv64      | 15.0            |
-| powerpc64    | 15.0            |
+| Architecture     | FreeBSD version |
+|------------------|-----------------|
+| powerpc64        | 15.0            |
+| powerpc64le      | 15.0            |
+| powerpc64elfv1   | 15.0            |
 
 ## Using the repository
 
-On a FreeBSD riscv64 system, create `/usr/local/etc/pkg/repos/custom.conf`:
+On a FreeBSD powerpc64 system, create `/usr/local/etc/pkg/repos/custom.conf`:
 
 ```
 custom: {
-    url: "https://<user>.github.io/freebsd-pkg-repo/FreeBSD:15:riscv64",
+    url: "https://<user>.github.io/freebsd-pkg-repo/FreeBSD:15:powerpc64",
     enabled: yes,
     signature_type: "none"
 }
 ```
+
+Replace `powerpc64` with `powerpc64le` or `powerpc64elfv1` for those ABIs.
 
 Then:
 
@@ -55,16 +58,17 @@ All configuration is driven by three plain-text lists. Add a line, push to
 Space-separated fields, one architecture per line:
 
 ```
-<poudriere_arch> <binmiscctl_name> <qemu_binary> <elf_magic_hex> <elf_mask_hex>
+<poudriere_arch> <binmiscctl_name> <qemu_binary> <elf_magic_hex> <elf_mask_hex> [qemu_args...]
 ```
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `poudriere_arch` | `TARGET.TARGET_ARCH` for `poudriere jail -a` | `riscv.riscv64` |
-| `binmiscctl_name` | Label for the binfmt entry; also used as the pkg ABI arch | `riscv64` |
-| `qemu_binary` | qemu-user-static interpreter in `/usr/local/bin/` | `qemu-riscv64-static` |
-| `elf_magic_hex` | ELF header bytes identifying this arch, as hex | `7f454c460201010000000000000000000200f300` |
-| `elf_mask_hex` | Mask (same length as magic); `ff`=match, `00`=wildcard | `ffffffffffffff00fffffffffffffffffeffffff` |
+| `poudriere_arch` | `TARGET.TARGET_ARCH` for `poudriere jail -a` | `powerpc.powerpc64` |
+| `binmiscctl_name` | Label for the binfmt entry; also used as the pkg ABI arch | `powerpc64` |
+| `qemu_binary` | qemu-user-static interpreter in `/usr/local/bin/` | `qemu-ppc64-static` |
+| `elf_magic_hex` | ELF header bytes identifying this arch, as hex | `7f454c4602020100000000000000000000020015` |
+| `elf_mask_hex` | Mask (same length as magic); `ff`=match, `00`=wildcard | `ffffffffffffff00fffffffffffffffffffeffff` |
+| `qemu_args` *(optional)* | Trailing fields appended to the interpreter, split on spaces at exec time | `-cpu power9` |
 
 Lines starting with `#` and blank lines are ignored.
 

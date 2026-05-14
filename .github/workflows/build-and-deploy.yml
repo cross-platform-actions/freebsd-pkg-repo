@@ -82,6 +82,9 @@ jobs:
           restore-keys: |
             packages-${{ matrix.jail_name }}-
 
+      - if: env.ACT
+        run: apt update && apt install -y dosfstools rsync fdisk
+
       - name: Build packages in FreeBSD VM
         if: ${{ !inputs.mock_build }}
         # Leaves ~20 minutes for cache save before the 6-hour job timeout.
@@ -91,6 +94,7 @@ jobs:
           POUDRIERE_ARCH: ${{ matrix.poudriere_arch }}
           BINMISCCTL_NAME: ${{ matrix.binmiscctl_name }}
           QEMU_BINARY: ${{ matrix.qemu_binary }}
+          QEMU_ARGS: ${{ matrix.qemu_args }}
           ELF_MAGIC: ${{ matrix.elf_magic }}
           ELF_MASK: ${{ matrix.elf_mask }}
           FREEBSD_VERSION: ${{ matrix.freebsd_version }}
@@ -109,7 +113,7 @@ jobs:
           # post-run, and termination is faster and avoids known teardown
           # freezes.
           shutdown_vm: false
-          environment_variables: POUDRIERE_ARCH BINMISCCTL_NAME QEMU_BINARY ELF_MAGIC ELF_MASK FREEBSD_VERSION JAIL_NAME
+          environment_variables: POUDRIERE_ARCH BINMISCCTL_NAME QEMU_BINARY QEMU_ARGS ELF_MAGIC ELF_MASK FREEBSD_VERSION JAIL_NAME
           run: sh scripts/build-packages.sh
 
       # cross-platform-actions' rsync sync-back does not --delete, so any

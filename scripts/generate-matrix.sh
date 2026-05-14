@@ -23,11 +23,18 @@ while IFS= read -r version || [ -n "$version" ]; do
         # Skip empty lines and comments
         case "$arch_line" in ''|\#*) continue ;; esac
 
-        poudriere_arch=$(echo "$arch_line" | awk '{print $1}')
-        binmiscctl_name=$(echo "$arch_line" | awk '{print $2}')
-        qemu_binary=$(echo "$arch_line" | awk '{print $3}')
-        elf_magic=$(echo "$arch_line" | awk '{print $4}')
-        elf_mask=$(echo "$arch_line" | awk '{print $5}')
+        # Split the line on whitespace. The optional 6th+ fields are
+        # collapsed into qemu_args so it can contain spaces (e.g.
+        # "-cpu power9").
+        # shellcheck disable=SC2086
+        set -- $arch_line
+        poudriere_arch=$1
+        binmiscctl_name=$2
+        qemu_binary=$3
+        elf_magic=$4
+        elf_mask=$5
+        shift 5
+        qemu_args=$*
 
         # Derive a short jail name from arch and version
         # e.g. riscv64 + 15.0 -> riscv64-150
@@ -44,8 +51,8 @@ while IFS= read -r version || [ -n "$version" ]; do
             printf ','
         fi
 
-        printf '{"poudriere_arch":"%s","binmiscctl_name":"%s","qemu_binary":"%s","elf_magic":"%s","elf_mask":"%s","freebsd_version":"%s","jail_name":"%s","major_version":"%s"}' \
-            "$poudriere_arch" "$binmiscctl_name" "$qemu_binary" "$elf_magic" "$elf_mask" "$version" "$jail_name" "$major_version"
+        printf '{"poudriere_arch":"%s","binmiscctl_name":"%s","qemu_binary":"%s","elf_magic":"%s","elf_mask":"%s","qemu_args":"%s","freebsd_version":"%s","jail_name":"%s","major_version":"%s"}' \
+            "$poudriere_arch" "$binmiscctl_name" "$qemu_binary" "$elf_magic" "$elf_mask" "$qemu_args" "$version" "$jail_name" "$major_version"
 
     done < "$ARCH_FILE"
 done < "$VERSIONS_FILE"

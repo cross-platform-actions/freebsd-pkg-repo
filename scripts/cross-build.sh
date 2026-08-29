@@ -105,11 +105,26 @@ CROSS_TOOLCHAIN="${TARGET_ARCH}-clang"
 # readelf's `Machine:` line for this target. Used twice: to smoke-test the
 # toolchain before anything is built, and to prove every packaged binary really
 # is for the target. An unlisted arch skips both checks rather than failing.
+#
+# MESON_* describe the same target to meson's cross file (step 4.5). meson
+# names CPU families its own way -- powerpc64 is "ppc64" there -- and it has no
+# way to infer endianness, so both are spelled out per arch.
 case "$TARGET_ARCH" in
-    riscv64)                 ELF_MACHINE="RISC-V" ;;
-    powerpc64|powerpc64le)   ELF_MACHINE="PowerPC64" ;;
-    aarch64)                 ELF_MACHINE="AArch64" ;;
-    *)                       ELF_MACHINE="" ;;
+    riscv64)
+        ELF_MACHINE="RISC-V"
+        MESON_CPU_FAMILY=riscv64; MESON_ENDIAN=little ;;
+    powerpc64)
+        ELF_MACHINE="PowerPC64"
+        MESON_CPU_FAMILY=ppc64;   MESON_ENDIAN=big ;;
+    powerpc64le)
+        ELF_MACHINE="PowerPC64"
+        MESON_CPU_FAMILY=ppc64;   MESON_ENDIAN=little ;;
+    aarch64)
+        ELF_MACHINE="AArch64"
+        MESON_CPU_FAMILY=aarch64; MESON_ENDIAN=little ;;
+    *)
+        ELF_MACHINE=""
+        MESON_CPU_FAMILY="$TARGET_ARCH"; MESON_ENDIAN=little ;;
 esac
 
 SYSROOT="$HOME/sysroot.$TARGET_ARCH"
@@ -322,6 +337,93 @@ HOSTCC=/usr/bin/cc \
 HOSTCXX=/usr/bin/c++"
 CROSS_ARGS="$CROSS_ARGS $CROSS_COMPILER_ARGS"
 
+# Mk/Uses/ssl.mk hardcodes OPENSSLBASE=/usr for base OpenSSL, and OPENSSLINC /
+# OPENSSLLIB follow from it. Those absolute paths are NOT sysroot-relative, so
+# a port using base OpenSSL (ftp/curl) is handed -I/usr/include -L/usr/lib and
+# links the build host's amd64 base libraries -- "C compiler cannot create
+# executables". Point them into the sysroot. ssl.mk assigns them with `=`, so
+# this has to be a command-line override rather than a make.conf default.
+#
+# This forces BASE OpenSSL for every port. That is right for this package set
+# and matches what the target actually ships; a port needing security/openssl
+# from the ports tree would have to be special-cased.
+CROSS_ARGS="$CROSS_ARGS \
+OPENSSLBASE=$SYSROOT/usr \
+OPENSSLINC=$SYSROOT/usr/include \
+OPENSSLLIB=$SYSROOT/usr/lib"
+
+# --- 4.5 Cross configuration for cmake and meson ----------------------------
+# Neither Mk/Uses/cmake.mk nor Mk/Uses/meson.mk has ANY cross support, so both
+# build systems probe the build host: cmake's find_package picked up the host's
+# amd64 /usr/lib/libz.so for security/libssh2 ("incompatible with
+# $SYSROOT/usr/lib/crti.o"), and meson tried to execute the target binary from
+# its own compiler sanity check for dns/libpsl.
+#
+# Both take their settings through variables the ports framework accumulates
+# with `+=` (CMAKE_ARGS, MESON_ARGS), which a command-line assignment would
+# REPLACE rather than extend -- and cmake.mk invokes cmake under `env -i`
+# (SETENVI), so an exported CMAKE_TOOLCHAIN_FILE would not survive either.
+# /etc/make.conf is the one hook that can append, so the cross configuration
+# and the two per-port workarounds below live there.
+echo "===== WRITING /etc/make.conf ====="
+MESON_CROSS_FILE="$HOME/meson-cross-$TARGET_ARCH.ini"
+cat > "$MESON_CROSS_FILE" <<EOF
+[binaries]
+c = '$CROSS_BINDIR/$TRIPLE-cc'
+cpp = '$CROSS_BINDIR/$TRIPLE-c++'
+ar = '/usr/bin/ar'
+strip = '/usr/bin/strip'
+pkg-config = '/usr/local/bin/pkgconf'
+
+[properties]
+sys_root = '$SYSROOT'
+pkg_config_libdir = ['$TARGET_LOCALBASE/libdata/pkgconfig', '$SYSROOT/usr/libdata/pkgconfig']
+
+[host_machine]
+system = 'freebsd'
+cpu_family = '$MESON_CPU_FAMILY'
+cpu = '$TARGET_ARCH'
+endian = '$MESON_ENDIAN'
+EOF
+cat "$MESON_CROSS_FILE"
+
+# CMAKE_FIND_ROOT_PATH is deliberately a single path with no ';' -- cmake.mk
+# expands CMAKE_ARGS through a shell, where a semicolon would end the command.
+# One root is enough: the target prefix lives inside the sysroot, and FreeBSD's
+# cmake already has /usr/local in CMAKE_SYSTEM_PREFIX_PATH.
+sudo sh -c 'cat > /etc/make.conf' <<EOF
+# Written by scripts/cross-build.sh -- cross-compilation settings that have to
+# be APPENDED to framework variables, which a make command line cannot do.
+
+CMAKE_ARGS+=	-DCMAKE_SYSTEM_NAME=FreeBSD
+CMAKE_ARGS+=	-DCMAKE_SYSTEM_PROCESSOR=${TARGET_ARCH}
+CMAKE_ARGS+=	-DCMAKE_SYSROOT=${SYSROOT}
+CMAKE_ARGS+=	-DCMAKE_FIND_ROOT_PATH=${SYSROOT}
+CMAKE_ARGS+=	-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+CMAKE_ARGS+=	-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+CMAKE_ARGS+=	-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+CMAKE_ARGS+=	-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+
+MESON_ARGS+=	--cross-file=${MESON_CROSS_FILE}
+
+# security/sudo's own configure hardcodes -R<libdir> into libsudo_util.so, so
+# the package shipped a RUNPATH of ${SYSROOT}/usr/lib. This is sudo's rpath
+# logic rather than libtool's, and --disable-rpath is its documented off switch.
+.if \${.CURDIR:M*/security/sudo}
+CONFIGURE_ARGS+=	--disable-rpath
+.endif
+
+# archivers/liblz4's default target builds an HTML manual by compiling
+# contrib/gen_manual FOR THE TARGET and then executing it on the build host,
+# which cannot work when cross-compiling. Upstream's "allmost" target is
+# precisely "all but the manuals" (all: allmost examples manuals build_tests),
+# so it yields the library and the lz4 CLI without the unrunnable step.
+.if \${.CURDIR:M*/archivers/liblz4}
+ALL_TARGET=	allmost
+.endif
+EOF
+cat /etc/make.conf
+
 # port_dir ORIGIN -> the port's directory, with any @flavor suffix stripped
 port_dir() { echo "$PORTSDIR/${1%@*}"; }
 
@@ -520,6 +622,17 @@ if [ -n "$host_tools" ]; then
         fi
     done
 fi
+
+# USES=python makes the closure depend on a VERSIONED interpreter
+# (lang/python312), which installs python3.12 but no bare `python3`. Ports that
+# invoke the framework's PYTHON_CMD are fine, but a configure script looking
+# for `python3` on PATH is not: net/rsync's aborts with "no - python3 not
+# found". lang/python3 is the meta-port that provides the unversioned link.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "===== no python3 on PATH; installing lang/python3 ====="
+    sudo pkg install -y lang/python3
+fi
+command -v python3 || echo "WARNING: still no python3 on PATH" >&2
 
 # --- 7. Cross-build each port in order --------------------------------------
 # NO_DEPENDS=yes: the closure was ordered in step 6, and the framework's own

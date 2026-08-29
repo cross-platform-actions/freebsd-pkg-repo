@@ -233,24 +233,64 @@ BATCH=yes"
 # passed as a single quoted argument instead.
 CROSS_AS="AS=/usr/bin/cc -target $TRIPLE --sysroot=$SYSROOT -c"
 
-# Repointing LOCALBASE at the sysroot breaks every HOST tool that
-# Mk/bsd.commands.mk resolves as ${LOCALBASE}/bin/<tool>: those are amd64
-# programs that have to run here, and they live in the real /usr/local, not in
-# the target prefix. PKG_BIN is the fatal one -- it defaults to
-# ${LOCALBASE}/sbin/pkg-static, which is what `make package` runs, so leaving
-# it would fail every single port.
+# Repointing LOCALBASE at the sysroot breaks every HOST tool the ports
+# framework resolves as ${LOCALBASE}/bin/<tool>: those are amd64 programs that
+# have to run here, and they live in the real /usr/local, not in the target
+# prefix. PKG_BIN (bsd.commands.mk) is the fatal one -- it is what `make
+# package` runs -- and CMAKE_BIN, AUTORECONF, PERL, MAKEINFO and friends across
+# Mk/Uses are the same bug with a smaller blast radius.
 #
-# Each of these is a `?=` default, so a command-line assignment wins. Derive
-# the list from bsd.commands.mk instead of hand-copying it, so a tool added or
-# renamed upstream is picked up rather than silently pointing into the sysroot.
-HOST_TOOL_ARGS="$(sed -n \
-    's|^\([A-Z0-9_]*\)?=[[:space:]]*${LOCALBASE}/\(.*\)$|\1=/usr/local/\2|p' \
-    "$PORTSDIR/Mk/bsd.commands.mk" | tr '\n' ' ')"
-[ -n "$HOST_TOOL_ARGS" ] ||
-    { echo "FATAL: found no \${LOCALBASE} tools in Mk/bsd.commands.mk -- the" \
-           "pattern no longer matches, so host tools would resolve into the" \
-           "sysroot" >&2; exit 1; }
-echo "host tool overrides: $HOST_TOOL_ARGS"
+# A ${LOCALBASE}/bin path is always a HOST executable, and /usr/local is where
+# it lives on this machine AND where the target's own copy lives at runtime, so
+# rewriting the prefix is right in both roles (it is also what makes
+# USES=shebangfix write a usable shebang). Only include/lib paths belong in the
+# sysroot.
+#
+# Derive the list rather than hand-copying it, so a tool added or renamed
+# upstream is picked up instead of silently resolving into the sysroot.
+# Command-line assignments beat both `?=` and `=` in the makefiles.
+#
+# Three exclusions:
+#   * CC/CXX/CPP and the binutils -- Mk/Uses/{objc,compiler}.mk assign these to
+#     ${LOCALBASE}/bin/clang*, and overriding them would replace the cross
+#     compiler for every port.
+#   * *_DEPENDS -- dependency specs (`path:origin`), not tool paths.
+#   * values containing whitespace (e.g. mono.mk's GACUTIL, which appends
+#     arguments) -- CROSS_ARGS is word-split onto the command line.
+derive_host_tools() {
+    cat "$PORTSDIR/Mk/bsd.commands.mk" "$PORTSDIR"/Mk/Uses/*.mk 2>/dev/null |
+    awk '
+        /^[A-Za-z_][A-Za-z0-9_]*\??=[ \t]*\$\{LOCALBASE\}\/(bin|sbin|libexec)\// {
+            name = $0; sub(/\??=.*$/, "", name);
+            val  = $0; sub(/^[^=]*=[ \t]*/, "", val);
+            if (val ~ /[ \t]/) next;
+            if (name ~ /_DEPENDS$/) next;
+            if (name ~ /^(CC|CXX|CPP|LD|AS|AR|NM|RANLIB|STRIP|OBJCOPY|SIZE|STRINGS)$/) next;
+            if (seen[name]++) next;
+            sub(/^\$\{LOCALBASE\}/, "/usr/local", val);
+            print name "=" val;
+        }'
+}
+HOST_TOOL_ARGS="$(derive_host_tools | tr '\n' ' ')"
+case "$HOST_TOOL_ARGS" in
+    *PKG_BIN=*CMAKE_BIN=*|*CMAKE_BIN=*PKG_BIN=*) : ;;
+    *) echo "FATAL: host tool derivation did not find both PKG_BIN and" \
+            "CMAKE_BIN -- the pattern no longer matches, so host tools would" \
+            "resolve into the sysroot" >&2; exit 1 ;;
+esac
+
+# Mk/Uses/shebangfix.mk defaults ${lang}_CMD to ${LOCALBASE}/bin/${lang} inside
+# a .for loop, so those names are not visible to the derivation above. The
+# value is substituted into installed scripts' shebang lines, which must name
+# the path on the TARGET -- a sysroot path there would be both a leak and
+# unrunnable. python/tcl/tk are already defaulted from PYTHON_CMD/TCLSH/WISH
+# earlier in that file, and those come from the derived list.
+for _lang in bash java ksh perl php ruby; do
+    HOST_TOOL_ARGS="$HOST_TOOL_ARGS ${_lang}_CMD=/usr/local/bin/${_lang}"
+done
+
+echo "host tool overrides:"
+printf '  %s\n' $HOST_TOOL_ARGS
 CROSS_ARGS="$CROSS_ARGS $HOST_TOOL_ARGS"
 
 # port_dir ORIGIN -> the port's directory, with any @flavor suffix stripped

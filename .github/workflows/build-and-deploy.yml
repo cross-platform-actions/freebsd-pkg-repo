@@ -22,9 +22,11 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
+# NOTE: no workflow-level concurrency group. Only the Pages deploy needs
+# serializing, and it carries its own group below. A workflow-level `pages`
+# group would make every build -- including a branch push that never deploys --
+# queue behind any other run of this workflow, so one long build blocks all
+# validation behind it.
 
 jobs:
   generate-matrix:
@@ -138,6 +140,10 @@ jobs:
     # A branch push validates the build; only master publishes.
     if: ${{ github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-latest
+    # Pages deploys must not overlap; builds may.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -228,6 +228,26 @@ BATCH=yes"
 # passed as a single quoted argument instead.
 CROSS_AS="AS=/usr/bin/cc -target $TRIPLE --sysroot=$SYSROOT -c"
 
+# Repointing LOCALBASE at the sysroot breaks every HOST tool that
+# Mk/bsd.commands.mk resolves as ${LOCALBASE}/bin/<tool>: those are amd64
+# programs that have to run here, and they live in the real /usr/local, not in
+# the target prefix. PKG_BIN is the fatal one -- it defaults to
+# ${LOCALBASE}/sbin/pkg-static, which is what `make package` runs, so leaving
+# it would fail every single port.
+#
+# Each of these is a `?=` default, so a command-line assignment wins. Derive
+# the list from bsd.commands.mk instead of hand-copying it, so a tool added or
+# renamed upstream is picked up rather than silently pointing into the sysroot.
+HOST_TOOL_ARGS="$(sed -n \
+    's|^\([A-Z0-9_]*\)?=[[:space:]]*${LOCALBASE}/\(.*\)$|\1=/usr/local/\2|p' \
+    "$PORTSDIR/Mk/bsd.commands.mk" | tr '\n' ' ')"
+[ -n "$HOST_TOOL_ARGS" ] ||
+    { echo "FATAL: found no \${LOCALBASE} tools in Mk/bsd.commands.mk -- the" \
+           "pattern no longer matches, so host tools would resolve into the" \
+           "sysroot" >&2; exit 1; }
+echo "host tool overrides: $HOST_TOOL_ARGS"
+CROSS_ARGS="$CROSS_ARGS $HOST_TOOL_ARGS"
+
 # port_dir ORIGIN -> the port's directory, with any @flavor suffix stripped
 port_dir() { echo "$PORTSDIR/${1%@*}"; }
 
@@ -277,6 +297,9 @@ assert_var CC "--sysroot=$SYSROOT"
 assert_var CROSS_HOST "$TRIPLE"
 assert_var LOCALBASE "$TARGET_LOCALBASE"
 assert_var PREFIX /usr/local
+# The host tools must stay in the real /usr/local even though LOCALBASE moved.
+# PKG_BIN is the one that would break every port, so assert it by name.
+assert_var PKG_BIN /usr/local/sbin/pkg-static
 
 # OSVERSION must come from the sysroot's sys/param.h and not from the build
 # host: it decides version-conditional patches and is what pkg records. Compare

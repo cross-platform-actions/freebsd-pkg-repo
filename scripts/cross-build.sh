@@ -157,10 +157,15 @@ rm -f base.txz
 [ -f "$SYSROOT/bin/sh" ] ||
     { echo "FATAL: sysroot has no bin/sh (needed for the package ABI)" >&2; exit 1; }
 
-# The target prefix is written to throughout the build -- every cross-built
-# package is unpacked into it -- so it must belong to the unprivileged user.
+# base.txz has to be unpacked as root (its files are root-owned and carry
+# flags), but from here on the sysroot is only ever read for headers and
+# libraries and written to with cross-built packages -- all as the
+# unprivileged user. Hand the whole tree over rather than just the target
+# prefix: step 7 unpacks each package from the sysroot root, and tar restores
+# the mtime of every directory it traverses, so a root-owned $SYSROOT or
+# $SYSROOT/usr fails with "Can't restore time: Operation not permitted".
 sudo mkdir -p "$TARGET_LOCALBASE"
-sudo chown -R "$(id -u):$(id -g)" "$TARGET_LOCALBASE"
+sudo chown -R "$(id -u):$(id -g)" "$SYSROOT"
 
 # --- 2. Cross toolchain -----------------------------------------------------
 # bsd.port.mk does
@@ -543,8 +548,10 @@ for origin in $build_order; do
     fi
 
     # Populate the target prefix for the ports built after this one. tar rather
-    # than cp -R so existing files and symlinks are overwritten cleanly.
-    ( cd "$staged" && tar -cf - . ) | ( cd "$SYSROOT" && tar -xf - )
+    # than cp -R so existing files and symlinks are overwritten cleanly, and
+    # -m so it does not try to restore mtimes on the sysroot's own directories
+    # (pointless here, and the first thing to fail on any dir we do not own).
+    ( cd "$staged" && tar -cf - . ) | ( cd "$SYSROOT" && tar -xmf - )
     rm -rf "$staged"
 
     built_pkgfiles="$built_pkgfiles $pkgfile"

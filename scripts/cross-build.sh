@@ -700,6 +700,16 @@ dump_config_logs() {  # $1 = origin
         echo "----- config.log: $cl (last 25 lines) -----"
         tail -n 25 "$cl" 2>/dev/null || true
     done
+    # meson keeps its own log, and it is the only place the failing probe's
+    # actual compiler invocation and error appear -- the terminal output just
+    # says "NO". Without this a meson cross failure needs another CI round trip
+    # to diagnose.
+    find "$(port_dir "$1")" -maxdepth 6 -name meson-log.txt 2>/dev/null |
+    while IFS= read -r ml; do
+        echo "----- meson-log: $ml (failed checks) -----"
+        grep -nE -A12 "Running compile:|Code:|Compiler stderr:" "$ml" 2>/dev/null |
+            head -n 120 || true
+    done
 }
 
 # normalise_sysroot DIR -- strip the sysroot prefix from every TEXT file under

@@ -344,11 +344,13 @@ CROSS_ARGS="$CROSS_ARGS $CROSS_COMPILER_ARGS"
 # executables". Point them into the sysroot. ssl.mk assigns them with `=`, so
 # this has to be a command-line override rather than a make.conf default.
 #
-# This forces BASE OpenSSL for every port. That is right for this package set
-# and matches what the target actually ships; a port needing security/openssl
-# from the ports tree would have to be special-cased.
+# OPENSSLBASE itself is deliberately left at /usr. Only the INC/LIB paths are
+# consumed as compiler flags; OPENSSLBASE is what ports hand to configure as
+# --with-openssl=/--enable-openssl=, and security/sudo records its configure
+# line inside the sudo binary for `sudo -V`. Redirecting it put the build
+# machine's sysroot into a shipped binary -- a real leak, for no benefit, since
+# /usr is already correct from the target's point of view.
 CROSS_ARGS="$CROSS_ARGS \
-OPENSSLBASE=$SYSROOT/usr \
 OPENSSLINC=$SYSROOT/usr/include \
 OPENSSLLIB=$SYSROOT/usr/lib"
 
@@ -376,6 +378,11 @@ strip = '/usr/bin/strip'
 pkg-config = '/usr/local/bin/pkgconf'
 
 [properties]
+# Without this meson still runs its compiler sanity-check binary and dies with
+# "binary or interpreter not executable" -- it only infers that it cannot
+# execute target binaries in some configurations, and a FreeBSD host building
+# for another FreeBSD architecture is not one of them.
+needs_exe_wrapper = true
 sys_root = '$SYSROOT'
 pkg_config_libdir = ['$TARGET_LOCALBASE/libdata/pkgconfig', '$SYSROOT/usr/libdata/pkgconfig']
 
@@ -648,6 +655,32 @@ command -v python3 || echo "WARNING: still no python3 on PATH" >&2
 # in the `"name": {origin: "o", version: "v"}` form create-manifest.sh expects
 # from ACTUAL-PACKAGE-DEPENDS. Direct dependencies only; pkg walks the graph
 # transitively from each package's own list.
+# dump_config_logs ORIGIN -- surface a configure failure in this run's log. A
+# cross-configure error ("cannot run C compiled programs", a missing target
+# library) is otherwise invisible without another CI round trip.
+dump_config_logs() {  # $1 = origin
+    find "$(port_dir "$1")" -maxdepth 4 -name config.log 2>/dev/null |
+    while IFS= read -r cl; do
+        echo "----- config.log: $cl (error lines) -----"
+        grep -nE "configure:[0-9]+:|error|cannot|conftest|clang|/ld|C compiler" \
+            "$cl" 2>/dev/null | head -n 60 || true
+        echo "----- config.log: $cl (last 25 lines) -----"
+        tail -n 25 "$cl" 2>/dev/null || true
+    done
+}
+
+# normalise_sysroot DIR -- strip the sysroot prefix from every TEXT file under
+# DIR, turning a build-time path into the target's own. grep -I skips binaries,
+# which must never be rewritten; sed -i needs an (empty) backup suffix on BSD.
+normalise_sysroot() {  # $1 = directory
+    [ -d "$1" ] || return 0
+    grep -Ilr "$SYSROOT" "$1" 2>/dev/null |
+    while IFS= read -r f; do
+        echo "  normalising sysroot path in ${f#$1}"
+        sed -i '' -e "s|$SYSROOT||g" "$f"
+    done
+}
+
 manifest_deps() {  # $1 = origin
     local origin dep
     origin="$1"
@@ -674,21 +707,37 @@ for origin in $build_order; do
     echo "manifest deps for $origin:"
     cat "$depfile"
 
-    if ! cross_make "$origin" package NO_DEPENDS=yes \
+    # Stage and package are run as separate steps so the staged tree can be
+    # rewritten in between -- see normalise_sysroot below.
+    if ! cross_make "$origin" stage NO_DEPENDS=yes \
             "ACTUAL-PACKAGE-DEPENDS=cat $depfile"; then
         echo "CROSS BUILD FAILED: $origin" >&2
         failed="$failed $origin"
-        # Surface the configure failure in this run's log; a cross-configure
-        # error ("cannot run C compiled programs", a missing target library) is
-        # otherwise invisible without another CI round trip.
-        find "$(port_dir "$origin")" -maxdepth 4 -name config.log 2>/dev/null |
-        while IFS= read -r cl; do
-            echo "----- config.log: $cl (error lines) -----"
-            grep -nE "configure:[0-9]+:|error|cannot|conftest|clang|/ld|C compiler" \
-                "$cl" 2>/dev/null | head -n 60 || true
-            echo "----- config.log: $cl (last 25 lines) -----"
-            tail -n 25 "$cl" 2>/dev/null || true
-        done
+        dump_config_logs "$origin"
+        continue
+    fi
+
+    # Translate build-time sysroot paths into the paths they will have on the
+    # target. A cross build cannot avoid recording some of these: pointing
+    # OPENSSLINC/OPENSSLLIB into the sysroot is what stops ftp/curl compiling
+    # against the host's amd64 base headers, and cmake then writes the
+    # directory it found OpenSSL in straight into libssh2.pc as
+    # `Libs.private: -L$SYSROOT/usr/lib`.
+    #
+    # Stripping the prefix is the correct translation, not a cover-up:
+    # $SYSROOT/usr IS /usr on the target. This is the same rewrite every
+    # cross-build system performs on staged metadata. It is deliberately
+    # limited to TEXT files (grep -I skips binaries) -- a sysroot path inside
+    # an ELF file is a RUNPATH or a compiled-in constant, which cannot be
+    # safely rewritten and must fail the build instead. The check below still
+    # enforces that.
+    normalise_sysroot "$(cross_make "$origin" -V STAGEDIR)"
+
+    if ! cross_make "$origin" package NO_DEPENDS=yes \
+            "ACTUAL-PACKAGE-DEPENDS=cat $depfile"; then
+        echo "CROSS PACKAGE FAILED: $origin" >&2
+        failed="$failed $origin(package)"
+        dump_config_logs "$origin"
         continue
     fi
 
@@ -704,9 +753,10 @@ for origin in $build_order; do
     staged="$(mktemp -d -t xbuild)"
     tar -xf "$pkgfile" -C "$staged" --exclude '+*'
 
-    # The sysroot path must never appear in a shipped file. If it does, the
-    # port baked ${LOCALBASE} into its output and the package is broken on the
-    # target -- fail rather than publish it.
+    # Text metadata was already translated in the staging dir, so anything
+    # still naming the sysroot here is inside a binary: a RUNPATH, or a path
+    # compiled in as a constant. Neither can be rewritten safely and both are
+    # broken on the target, so fail rather than publish.
     if grep -rl "$SYSROOT" "$staged" 2>/dev/null | grep -q .; then
         echo "FATAL: $origin leaked the sysroot path into its package:" >&2
         # Say HOW it leaked, not just that it did. A path recorded in an ELF

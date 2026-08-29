@@ -251,7 +251,8 @@ for _pair in "cc:cc" "c++:c++" "cpp:cpp"; do
 #!/bin/sh
 exec /usr/bin/${_base} -target ${TRIPLE} --sysroot=${SYSROOT} \\
     -isystem ${TARGET_LOCALBASE}/include \\
-    -L${TARGET_LOCALBASE}/lib "\$@"
+    -L${TARGET_LOCALBASE}/lib \\
+    -L${SYSROOT}/usr/lib "\$@"
 EOF
     sudo chmod 755 "${CROSS_BINDIR}/${TRIPLE}-${_name}"
 done
@@ -344,15 +345,22 @@ CROSS_ARGS="$CROSS_ARGS $CROSS_COMPILER_ARGS"
 # executables". Point them into the sysroot. ssl.mk assigns them with `=`, so
 # this has to be a command-line override rather than a make.conf default.
 #
-# OPENSSLBASE itself is deliberately left at /usr. Only the INC/LIB paths are
-# consumed as compiler flags; OPENSSLBASE is what ports hand to configure as
-# --with-openssl=/--enable-openssl=, and security/sudo records its configure
-# line inside the sudo binary for `sudo -V`. Redirecting it put the build
-# machine's sysroot into a shipped binary -- a real leak, for no benefit, since
-# /usr is already correct from the target's point of view.
-CROSS_ARGS="$CROSS_ARGS \
-OPENSSLINC=$SYSROOT/usr/include \
-OPENSSLLIB=$SYSROOT/usr/lib"
+# Only OPENSSLINC is redirected, and only because it becomes a -I flag: -I
+# outranks the sysroot's own include path, so leaving it at /usr/include would
+# have ftp/curl compile against the build host's amd64 base headers.
+#
+# OPENSSLBASE and OPENSSLLIB are deliberately left at /usr. OPENSSLBASE is what
+# ports pass to configure, and security/sudo records its configure line inside
+# the sudo binary for `sudo -V`, so redirecting it wrote the sysroot into a
+# shipped binary. OPENSSLLIB becomes -L, and libtool hardcodes a RUNPATH for
+# any -L directory it does not recognise as a system one -- that is what put
+# $SYSROOT/usr/lib into libsudo_util.so. The wrapper carries -L$SYSROOT/usr/lib
+# instead, where it still precedes the port's own -L/usr/lib on the link line
+# but is invisible to libtool.
+CROSS_ARGS="$CROSS_ARGS OPENSSLINC=$SYSROOT/usr/include"
+
+# Make bsd.port.mk include Mk/bsd.local.mk (written below).
+CROSS_ARGS="$CROSS_ARGS USE_LOCAL_MK=yes"
 
 # --- 4.5 Cross configuration for cmake and meson ----------------------------
 # Neither Mk/Uses/cmake.mk nor Mk/Uses/meson.mk has ANY cross support, so both
@@ -361,13 +369,21 @@ OPENSSLLIB=$SYSROOT/usr/lib"
 # $SYSROOT/usr/lib/crti.o"), and meson tried to execute the target binary from
 # its own compiler sanity check for dns/libpsl.
 #
-# Both take their settings through variables the ports framework accumulates
-# with `+=` (CMAKE_ARGS, MESON_ARGS), which a command-line assignment would
-# REPLACE rather than extend -- and cmake.mk invokes cmake under `env -i`
-# (SETENVI), so an exported CMAKE_TOOLCHAIN_FILE would not survive either.
-# /etc/make.conf is the one hook that can append, so the cross configuration
-# and the two per-port workarounds below live there.
-echo "===== WRITING /etc/make.conf ====="
+# Both take their settings through variables the framework accumulates with
+# `+=` (CMAKE_ARGS, MESON_ARGS), which a command-line assignment would REPLACE
+# rather than extend -- and cmake.mk invokes cmake under `env -i` (SETENVI), so
+# an exported CMAKE_TOOLCHAIN_FILE would not survive either.
+#
+# /etc/make.conf is read BEFORE the port's own Makefile, which is too early to
+# be useful: dns/libpsl opens with `MESON_ARGS= --default-library=both` and
+# security/sudo with `CONFIGURE_ARGS= --mandir=...`, and a plain `=` discards
+# whatever make.conf appended. (archivers/liblz4 was fixed from make.conf only
+# because ALL_TARGET is a hard assignment there, which hid the problem.)
+#
+# Mk/bsd.local.mk is the hook that runs late: bsd.port.mk `.sinclude`s it under
+# USE_LOCAL_MK, and the inclusion guarded by _POSTMKINCLUDED happens after the
+# port Makefile has been read, so an append there survives.
+echo "===== WRITING Mk/bsd.local.mk ====="
 MESON_CROSS_FILE="$HOME/meson-cross-$TARGET_ARCH.ini"
 cat > "$MESON_CROSS_FILE" <<EOF
 [binaries]
@@ -398,9 +414,15 @@ cat "$MESON_CROSS_FILE"
 # expands CMAKE_ARGS through a shell, where a semicolon would end the command.
 # One root is enough: the target prefix lives inside the sysroot, and FreeBSD's
 # cmake already has /usr/local in CMAKE_SYSTEM_PREFIX_PATH.
-sudo sh -c 'cat > /etc/make.conf' <<EOF
+cat > "$PORTSDIR/Mk/bsd.local.mk" <<EOF
 # Written by scripts/cross-build.sh -- cross-compilation settings that have to
 # be APPENDED to framework variables, which a make command line cannot do.
+#
+# Guarded on _POSTMKINCLUDED so this applies at the LATE inclusion only: the
+# earlier one runs before the port Makefile, where a port's own \`MESON_ARGS=\`
+# or \`CONFIGURE_ARGS=\` would discard everything appended here.
+.if defined(_POSTMKINCLUDED) && !defined(_CROSS_LOCAL_MK)
+_CROSS_LOCAL_MK=	yes
 
 CMAKE_ARGS+=	-DCMAKE_SYSTEM_NAME=FreeBSD
 CMAKE_ARGS+=	-DCMAKE_SYSTEM_PROCESSOR=${TARGET_ARCH}
@@ -413,9 +435,11 @@ CMAKE_ARGS+=	-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
 
 MESON_ARGS+=	--cross-file=${MESON_CROSS_FILE}
 
-# security/sudo's own configure hardcodes -R<libdir> into libsudo_util.so, so
-# the package shipped a RUNPATH of ${SYSROOT}/usr/lib. This is sudo's rpath
-# logic rather than libtool's, and --disable-rpath is its documented off switch.
+# Defence in depth for the RUNPATH libsudo_util.so kept acquiring. The actual
+# cause turned out to be libtool hardcoding the -L${SYSROOT}/usr/lib that
+# OPENSSLLIB used to add -- fixed by carrying that -L inside the compiler
+# wrapper, where libtool cannot see it. sudo's configure has its own -R logic
+# on top, and --disable-rpath is its documented off switch.
 .if \${.CURDIR:M*/security/sudo}
 CONFIGURE_ARGS+=	--disable-rpath
 .endif
@@ -428,8 +452,10 @@ CONFIGURE_ARGS+=	--disable-rpath
 .if \${.CURDIR:M*/archivers/liblz4}
 ALL_TARGET=	allmost
 .endif
+
+.endif
 EOF
-cat /etc/make.conf
+cat "$PORTSDIR/Mk/bsd.local.mk"
 
 # port_dir ORIGIN -> the port's directory, with any @flavor suffix stripped
 port_dir() { echo "$PORTSDIR/${1%@*}"; }
@@ -486,6 +512,13 @@ assert_var PREFIX /usr/local
 assert_var PKG_BIN /usr/local/sbin/pkg-static
 # pkgconf, on the other hand, must read the TARGET prefix's .pc files.
 assert_var PKG_CONFIG_LIBDIR "$TARGET_LOCALBASE/libdata/pkgconfig"
+# Mk/bsd.local.mk must actually be reaching the ports. This failed silently
+# once already -- the same settings in /etc/make.conf were read too early and
+# discarded by ports that assign MESON_ARGS/CONFIGURE_ARGS with a plain `=`,
+# and the only symptom was meson reporting "Build type: native build" deep in
+# one port's log.
+assert_var CMAKE_ARGS -DCMAKE_SYSTEM_NAME=FreeBSD
+assert_var MESON_ARGS --cross-file=
 
 # OSVERSION must come from the sysroot's sys/param.h and not from the build
 # host: it decides version-conditional patches and is what pkg records. Compare

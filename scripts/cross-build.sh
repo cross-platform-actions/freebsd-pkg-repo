@@ -36,28 +36,37 @@
 # port with NO_DEPENDS=yes, which switches the framework's dependency machinery
 # off entirely.
 #
-# That leaves two prefixes, which must be kept apart:
+# That leaves two prefixes:
 #
 #   host prefix    /usr/local              amd64 build tools, plain
 #                                          `pkg install` from the official
 #                                          amd64 repo, reached via PATH
 #   target prefix  $SYSROOT/usr/local      cross-built target libraries and
-#                                          headers -- this is what LOCALBASE
-#                                          points at
+#                                          headers
 #
-# LOCALBASE has to point into the sysroot because USES=localbase emits
-# `-isystem ${LOCALBASE}/include` and `-L${LOCALBASE}/lib`
-# (Mk/Uses/localbase.mk); left at /usr/local those would resolve to amd64
-# headers and libraries. PREFIX is then pinned back to /usr/local so the
-# produced package still installs to the right place on the target -- without
-# it, PREFIX?=${LOCALBASE} would bake the sysroot path into every package.
+# LOCALBASE is left at /usr/local and is NOT repointed at the target prefix.
+# That was tried, and it is wrong: ports use LOCALBASE as a TARGET RUNTIME
+# path, not merely as a build-time search path. shells/bash compiles it into
+# its default PATH and into the locations of profile and inputrc, so a build
+# with LOCALBASE=$SYSROOT/usr/local shipped a bash whose PATH pointed at the
+# build machine's sysroot. The same assumption runs through USES=shebangfix
+# (shebang lines), Mk/bsd.commands.mk and ~50 Mk/Uses variables (host tool
+# paths), and libtool's idea of where a library will live. /usr/local is
+# simultaneously where the host's tools are and where the target's own prefix
+# will be, so leaving it alone makes every one of those uses correct at once.
 #
-# The failure mode that pairing can produce is a port baking ${LOCALBASE} into
-# an installed file, shipping an absolute $SYSROOT/... path that means nothing
-# on the target. Step 7 greps every packaged file for the sysroot path and
-# fails the build rather than publishing it.
+# The target prefix instead reaches the compiler through the wrapper scripts in
+# step 2, which carry -isystem/-L for it internally. Because those never appear
+# in CFLAGS, LDFLAGS or a configure line, the sysroot path stays out of
+# recorded build strings, generated .pc files, and libtool's -L bookkeeping
+# (libtool hardcodes a RUNPATH for any -L directory it does not recognise as a
+# system one, which was stamping $SYSROOT/usr/lib into sudo's libraries).
 #
-# One more consequence of the split: the framework normally fills a package's
+# Step 7 still greps every packaged file for the sysroot path and fails the
+# build rather than publishing it, since that is the invariant this whole
+# arrangement exists to preserve.
+#
+# The framework normally fills a package's
 # dependency list by locating each LIB_DEPENDS library on disk and asking the
 # HOST's pkg database who owns it (Mk/Scripts/actual-package-depends.sh). Our
 # target libraries live in the sysroot and are registered in no database at
@@ -209,27 +218,43 @@ echo "===== WRITING CROSS TOOLCHAIN ($CROSS_TOOLCHAIN) ====="
 # The wrappers live in the host prefix (they are amd64 programs, and this is
 # where devel/freebsd-gcc13 would install its equivalents), never in the
 # sysroot, so their path is meaningful wherever it is recorded.
+# The wrappers also carry the TARGET PREFIX search paths. That is what keeps
+# the sysroot out of the build's own vocabulary: because -isystem and -L are
+# baked into argv[0] rather than passed through CFLAGS/LDFLAGS, the sysroot
+# path never reaches a configure line, a recorded CFLAGS string, a generated
+# .pc file, or libtool -- which hardcodes a RUNPATH for any -L directory it
+# does not recognise as a system directory, and was stamping
+# $SYSROOT/usr/lib into sudo's and libidn2's shared libraries.
+#
+# They come before "$@", so they win over the host's own /usr/local/include
+# that USES=localbase appends.
 CROSS_BINDIR=/usr/local/bin
 for _pair in "cc:cc" "c++:c++" "cpp:cpp"; do
     _name="${_pair%%:*}"
     _base="${_pair#*:}"
     sudo sh -c "cat > ${CROSS_BINDIR}/${TRIPLE}-${_name}" <<EOF
 #!/bin/sh
-exec /usr/bin/${_base} -target ${TRIPLE} --sysroot=${SYSROOT} "\$@"
+exec /usr/bin/${_base} -target ${TRIPLE} --sysroot=${SYSROOT} \\
+    -isystem ${TARGET_LOCALBASE}/include \\
+    -L${TARGET_LOCALBASE}/lib "\$@"
 EOF
     sudo chmod 755 "${CROSS_BINDIR}/${TRIPLE}-${_name}"
 done
+cat "${CROSS_BINDIR}/${TRIPLE}-cc"
 "${CROSS_BINDIR}/${TRIPLE}-cc" --version | head -n 1
 
-mkdir -p "$TARGET_LOCALBASE/share/toolchains"
-cat > "$TARGET_LOCALBASE/share/toolchains/${CROSS_TOOLCHAIN}.mk" <<EOF
+# LOCALBASE stays /usr/local (see the header), so the toolchain file that
+# bsd.port.mk includes as ${LOCALBASE}/share/toolchains/<name>.mk belongs in
+# the HOST prefix -- which is also where devel/freebsd-gcc13 would install it.
+sudo mkdir -p /usr/local/share/toolchains
+sudo sh -c "cat > /usr/local/share/toolchains/${CROSS_TOOLCHAIN}.mk" <<EOF
 XCC=${CROSS_BINDIR}/${TRIPLE}-cc
 XCXX=${CROSS_BINDIR}/${TRIPLE}-c++
 XCPP=${CROSS_BINDIR}/${TRIPLE}-cpp
 CROSS_BINUTILS_PREFIX=/usr/bin/
 X_COMPILER_TYPE=clang
 EOF
-cat "$TARGET_LOCALBASE/share/toolchains/${CROSS_TOOLCHAIN}.mk"
+cat "/usr/local/share/toolchains/${CROSS_TOOLCHAIN}.mk"
 
 # --- 3. Ports tree ----------------------------------------------------------
 # Pinned to a quarterly branch for reproducibility, and fetched as a tarball
@@ -247,8 +272,18 @@ fi
     { echo "FATAL: no ports tree at $PORTSDIR" >&2; exit 1; }
 
 # --- 4. The cross make arguments --------------------------------------------
-# Passed on every ports make command line. See the header for why LOCALBASE and
-# PREFIX are split the way they are.
+# Passed on every ports make command line.
+#
+# LOCALBASE is deliberately NOT set here -- see the header. It stays /usr/local,
+# which is simultaneously where the host's build tools live and where the
+# target's own prefix lives at runtime, so every use of it is correct without
+# any intervention. The target prefix reaches the compiler through the wrappers
+# instead.
+#
+# PKG_CONFIG_LIBDIR is the exception that does have to be redirected: pkgconf
+# would otherwise read the HOST prefix's .pc files and report amd64 libraries.
+# bsd.port.mk already sets PKG_CONFIG_SYSROOT_DIR, which prefixes the paths
+# those files name.
 #
 # AS needs the override. bsd.port.mk derives the whole binutils set uniformly
 # as ${CROSS_BINUTILS_PREFIX}${tool} -- fine for ar/ld/nm/objcopy/ranlib/size/
@@ -261,10 +296,10 @@ fi
 CROSS_ARGS="PORTSDIR=$PORTSDIR \
 CROSS_TOOLCHAIN=$CROSS_TOOLCHAIN \
 CROSS_SYSROOT=$SYSROOT \
-LOCALBASE=$TARGET_LOCALBASE \
-PREFIX=/usr/local \
 PACKAGES=$PACKAGES \
 BATCH=yes"
+CROSS_ARGS="$CROSS_ARGS \
+PKG_CONFIG_LIBDIR=$TARGET_LOCALBASE/libdata/pkgconfig:$SYSROOT/usr/libdata/pkgconfig"
 # Kept out of CROSS_ARGS because its value contains spaces: CROSS_ARGS is
 # deliberately word-split onto the make command line, so this one has to be
 # passed as a single quoted argument instead.
@@ -286,66 +321,6 @@ CPP=$CROSS_BINDIR/$TRIPLE-cpp \
 HOSTCC=/usr/bin/cc \
 HOSTCXX=/usr/bin/c++"
 CROSS_ARGS="$CROSS_ARGS $CROSS_COMPILER_ARGS"
-
-# Repointing LOCALBASE at the sysroot breaks every HOST tool the ports
-# framework resolves as ${LOCALBASE}/bin/<tool>: those are amd64 programs that
-# have to run here, and they live in the real /usr/local, not in the target
-# prefix. PKG_BIN (bsd.commands.mk) is the fatal one -- it is what `make
-# package` runs -- and CMAKE_BIN, AUTORECONF, PERL, MAKEINFO and friends across
-# Mk/Uses are the same bug with a smaller blast radius.
-#
-# A ${LOCALBASE}/bin path is always a HOST executable, and /usr/local is where
-# it lives on this machine AND where the target's own copy lives at runtime, so
-# rewriting the prefix is right in both roles (it is also what makes
-# USES=shebangfix write a usable shebang). Only include/lib paths belong in the
-# sysroot.
-#
-# Derive the list rather than hand-copying it, so a tool added or renamed
-# upstream is picked up instead of silently resolving into the sysroot.
-# Command-line assignments beat both `?=` and `=` in the makefiles.
-#
-# Three exclusions:
-#   * CC/CXX/CPP and the binutils -- Mk/Uses/{objc,compiler}.mk assign these to
-#     ${LOCALBASE}/bin/clang*, and overriding them would replace the cross
-#     compiler for every port.
-#   * *_DEPENDS -- dependency specs (`path:origin`), not tool paths.
-#   * values containing whitespace (e.g. mono.mk's GACUTIL, which appends
-#     arguments) -- CROSS_ARGS is word-split onto the command line.
-derive_host_tools() {
-    cat "$PORTSDIR/Mk/bsd.commands.mk" "$PORTSDIR"/Mk/Uses/*.mk 2>/dev/null |
-    awk '
-        /^[A-Za-z_][A-Za-z0-9_]*\??=[ \t]*\$\{LOCALBASE\}\/(bin|sbin|libexec)\// {
-            name = $0; sub(/\??=.*$/, "", name);
-            val  = $0; sub(/^[^=]*=[ \t]*/, "", val);
-            if (val ~ /[ \t]/) next;
-            if (name ~ /_DEPENDS$/) next;
-            if (name ~ /^(CC|CXX|CPP|LD|AS|AR|NM|RANLIB|STRIP|OBJCOPY|SIZE|STRINGS)$/) next;
-            if (seen[name]++) next;
-            sub(/^\$\{LOCALBASE\}/, "/usr/local", val);
-            print name "=" val;
-        }'
-}
-HOST_TOOL_ARGS="$(derive_host_tools | tr '\n' ' ')"
-case "$HOST_TOOL_ARGS" in
-    *PKG_BIN=*CMAKE_BIN=*|*CMAKE_BIN=*PKG_BIN=*) : ;;
-    *) echo "FATAL: host tool derivation did not find both PKG_BIN and" \
-            "CMAKE_BIN -- the pattern no longer matches, so host tools would" \
-            "resolve into the sysroot" >&2; exit 1 ;;
-esac
-
-# Mk/Uses/shebangfix.mk defaults ${lang}_CMD to ${LOCALBASE}/bin/${lang} inside
-# a .for loop, so those names are not visible to the derivation above. The
-# value is substituted into installed scripts' shebang lines, which must name
-# the path on the TARGET -- a sysroot path there would be both a leak and
-# unrunnable. python/tcl/tk are already defaulted from PYTHON_CMD/TCLSH/WISH
-# earlier in that file, and those come from the derived list.
-for _lang in bash java ksh perl php ruby; do
-    HOST_TOOL_ARGS="$HOST_TOOL_ARGS ${_lang}_CMD=/usr/local/bin/${_lang}"
-done
-
-echo "host tool overrides:"
-printf '  %s\n' $HOST_TOOL_ARGS
-CROSS_ARGS="$CROSS_ARGS $HOST_TOOL_ARGS"
 
 # port_dir ORIGIN -> the port's directory, with any @flavor suffix stripped
 port_dir() { echo "$PORTSDIR/${1%@*}"; }
@@ -394,11 +369,14 @@ assert_var ARCH "$TARGET_ARCH"
 assert_var CC "$TRIPLE-cc"
 assert_var HOSTCC /usr/bin/cc
 assert_var CROSS_HOST "$TRIPLE"
-assert_var LOCALBASE "$TARGET_LOCALBASE"
+# LOCALBASE must NOT have moved into the sysroot -- see the header. Assert it,
+# because that mistake is silent: the build succeeds and the breakage only
+# shows up as a build-machine path compiled into a shipped binary.
+assert_var LOCALBASE /usr/local
 assert_var PREFIX /usr/local
-# The host tools must stay in the real /usr/local even though LOCALBASE moved.
-# PKG_BIN is the one that would break every port, so assert it by name.
 assert_var PKG_BIN /usr/local/sbin/pkg-static
+# pkgconf, on the other hand, must read the TARGET prefix's .pc files.
+assert_var PKG_CONFIG_LIBDIR "$TARGET_LOCALBASE/libdata/pkgconfig"
 
 # OSVERSION must come from the sysroot's sys/param.h and not from the build
 # host: it decides version-conditional patches and is what pkg records. Compare
@@ -518,8 +496,9 @@ done < "$PKGLIST"
 # A port can legitimately appear in both lists -- gettext-runtime is a target
 # library for bash and a host dependency of gettext-tools. Installing the amd64
 # build of it alongside the cross-built one is harmless precisely because the
-# two prefixes are separate: the host copy lands in /usr/local, the target copy
-# in $SYSROOT/usr/local, and only the latter is on LOCALBASE.
+# two prefixes are separate: the host copy lands in /usr/local, where only
+# host tools are looked up, and the target copy in $SYSROOT/usr/local, which
+# only the compiler wrappers search.
 host_tools="$(printf '%s\n' $host_tools | sort -u)"
 echo "target build order:$build_order"
 echo "host tools:"
@@ -547,7 +526,8 @@ fi
 # dependency checks cannot tell the two prefixes apart.
 #
 # After each build the package is unpacked into the sysroot so the next port
-# finds its headers and libraries under LOCALBASE. Unpacking the tarball
+# finds its headers and libraries on the wrappers' search path. Unpacking the
+# tarball
 # directly rather than `pkg -r $SYSROOT add` avoids arguing pkg out of its ABI
 # check for no benefit -- nothing here reads the target's package database.
 

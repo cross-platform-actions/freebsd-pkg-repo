@@ -372,6 +372,16 @@ CROSS_ARGS="$CROSS_ARGS $CROSS_COMPILER_ARGS"
 # but is invisible to libtool.
 CROSS_ARGS="$CROSS_ARGS OPENSSLINC=$SYSROOT/usr/include"
 
+# Mk/Uses/gssapi.mk has the identical problem for base Kerberos: KRB5_HOME
+# defaults to /usr, from which it derives GSSAPICPPFLAGS=-I/usr/include, and
+# ftp/curl feeds that straight into its own CPPFLAGS. That put the build host's
+# amd64 /usr/include ahead of the sysroot's, so curl compiled base headers from
+# two different architectures at once and died on
+# "/usr/include/sys/_ucontext.h: unknown type name 'mcontext_t'". KRB5_HOME is
+# a ?= default, so a command-line assignment redirects the whole family
+# (GSSAPIBASEDIR, GSSAPIINCDIR, GSSAPILIBDIR) into the sysroot.
+CROSS_ARGS="$CROSS_ARGS KRB5_HOME=$SYSROOT/usr"
+
 # Make bsd.port.mk include Mk/bsd.local.mk (written below).
 CROSS_ARGS="$CROSS_ARGS USE_LOCAL_MK=yes"
 

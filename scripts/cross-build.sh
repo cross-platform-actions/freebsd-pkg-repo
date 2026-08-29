@@ -249,6 +249,19 @@ for _pair in "cc:cc" "c++:c++" "cpp:cpp"; do
     _base="${_pair#*:}"
     sudo sh -c "cat > ${CROSS_BINDIR}/${TRIPLE}-${_name}" <<EOF
 #!/bin/sh
+# -L is withheld from compile-only invocations. clang reports an unused -L as
+# -Wunused-command-line-argument, and meson promotes exactly that to an error
+# in every compiler probe it runs, so passing -L unconditionally made all of
+# them fail -- including "supports function attribute visibility", which then
+# left dns/libpsl's symbols unexported and its own tool unable to link.
+# -isystem needs no such guard: clang does not warn about it when only linking.
+for _a in "\$@"; do
+    case "\$_a" in
+        -c|-S|-E)
+            exec /usr/bin/${_base} -target ${TRIPLE} --sysroot=${SYSROOT} \\
+                -isystem ${TARGET_LOCALBASE}/include "\$@" ;;
+    esac
+done
 exec /usr/bin/${_base} -target ${TRIPLE} --sysroot=${SYSROOT} \\
     -isystem ${TARGET_LOCALBASE}/include \\
     -L${TARGET_LOCALBASE}/lib \\

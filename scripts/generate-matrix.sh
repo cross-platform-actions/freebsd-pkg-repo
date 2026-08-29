@@ -23,19 +23,14 @@ while IFS= read -r version || [ -n "$version" ]; do
         # Skip empty lines and comments
         case "$arch_line" in ''|\#*) continue ;; esac
 
-        poudriere_arch=$(echo "$arch_line" | awk '{print $1}')
-        binmiscctl_name=$(echo "$arch_line" | awk '{print $2}')
-        qemu_binary=$(echo "$arch_line" | awk '{print $3}')
-        elf_magic=$(echo "$arch_line" | awk '{print $4}')
-        elf_mask=$(echo "$arch_line" | awk '{print $5}')
+        target_arch=$(echo "$arch_line" | awk '{print $1}')
+        release_machine=$(echo "$arch_line" | awk '{print $2}')
 
-        # Derive a short jail name from arch and version
-        # e.g. riscv64 + 15.0 -> riscv64-150
-        short_arch=$(echo "$poudriere_arch" | sed 's/.*\.//')
-        jail_version=$(echo "$version" | tr -d '.')
-        jail_name="${short_arch}-${jail_version}"
+        # A short slug for job names and artifact names,
+        # e.g. powerpc64 + 15.0 -> powerpc64-150
+        build_name="${target_arch}-$(echo "$version" | tr -d '.')"
 
-        # Derive the FreeBSD major version for the ABI path
+        # The FreeBSD major version, for the pkg ABI path
         major_version=$(echo "$version" | cut -d. -f1)
 
         if [ "$first" = true ]; then
@@ -44,8 +39,8 @@ while IFS= read -r version || [ -n "$version" ]; do
             printf ','
         fi
 
-        printf '{"poudriere_arch":"%s","binmiscctl_name":"%s","qemu_binary":"%s","elf_magic":"%s","elf_mask":"%s","freebsd_version":"%s","jail_name":"%s","major_version":"%s"}' \
-            "$poudriere_arch" "$binmiscctl_name" "$qemu_binary" "$elf_magic" "$elf_mask" "$version" "$jail_name" "$major_version"
+        printf '{"target_arch":"%s","release_machine":"%s","freebsd_version":"%s","build_name":"%s","major_version":"%s"}' \
+            "$target_arch" "$release_machine" "$version" "$build_name" "$major_version"
 
     done < "$ARCH_FILE"
 done < "$VERSIONS_FILE"

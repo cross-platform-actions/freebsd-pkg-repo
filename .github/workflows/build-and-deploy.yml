@@ -1,9 +1,15 @@
 name: Build and Deploy Packages
 
+# Entry points:
+#   * a push to master builds every target and deploys the repository;
+#   * a push to any other branch builds only, to validate the change;
+#   * workflow_dispatch does the same as a branch push (see mock_build).
 on:
   push:
     branches:
-      - master
+      # '**' not '*': a single star stops at '/', so a namespaced branch
+      # (feature/foo) would never be validated.
+      - '**'
   workflow_dispatch:
     inputs:
       mock_build:
@@ -37,10 +43,13 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.binmiscctl_name }} (FreeBSD ${{ matrix.freebsd_version }})
+    name: Cross-build ${{ matrix.target_arch }} (FreeBSD ${{ matrix.freebsd_version }})
     needs: generate-matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # The packages are cross-compiled on a KVM-accelerated FreeBSD/amd64 guest,
+    # so a run is minutes rather than the hours QEMU user-mode emulation took.
+    # This bound only exists to cap a hung VM boot.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -52,9 +61,8 @@ jobs:
       # Shortcut for iterating on the deploy path: manually dispatch the
       # workflow with mock_build=true. A handful of empty .pkg files plus
       # the expected metadata filenames are generated so the rest of the
-      # pipeline (prepare tarball, upload-artifact, download-artifact,
-      # extract, upload-pages-artifact, deploy-pages) runs against a
-      # realistic `packages/` shape without waiting hours for the real VM.
+      # pipeline runs against a realistic `packages/` shape without waiting
+      # for the real VM.
       - name: Mock build -- generate fake packages
         if: ${{ inputs.mock_build }}
         run: |
@@ -68,87 +76,52 @@ jobs:
           : > packages/data.pkg
           : > packages/packagesite.pkg
 
-      # Restore previously-built packages. A unique key per run means save
-      # always succeeds; the restore-keys prefix falls back to the most
-      # recent cache for this jail. Progressive runs converge to a full
-      # build under the 6-hour job limit.
-      - name: Restore packages cache
-        id: cache-restore
+      # Read the pinned ports branch so it can be passed into the guest.
+      - name: Read ports branch
         if: ${{ !inputs.mock_build }}
-        uses: actions/cache/restore@v4
-        with:
-          path: packages
-          key: packages-${{ matrix.jail_name }}-${{ github.run_id }}
-          restore-keys: |
-            packages-${{ matrix.jail_name }}-
+        id: cfg
+        run: |
+          branch=$(grep -v '^[[:space:]]*#' config/ports_branch \
+              | grep -v '^[[:space:]]*$' | head -n1)
+          echo "ports_branch=$branch" >> "$GITHUB_OUTPUT"
 
-      - name: Build packages in FreeBSD VM
+      # The guest is the BUILD HOST only: always FreeBSD/amd64, regardless of
+      # which architecture is being targeted. The target's headers, libraries
+      # and OS version come from the sysroot the script unpacks from
+      # base.txz, so its version is matrix.freebsd_version and its
+      # architecture matrix.target_arch.
+      - name: Cross-build packages on FreeBSD/amd64
         if: ${{ !inputs.mock_build }}
-        # Leaves ~20 minutes for cache save before the 6-hour job timeout.
-        timeout-minutes: 340
-        uses: cross-platform-actions/action@v1.0.0
+        uses: cross-platform-actions/action@v1.3.0
         env:
-          POUDRIERE_ARCH: ${{ matrix.poudriere_arch }}
-          BINMISCCTL_NAME: ${{ matrix.binmiscctl_name }}
-          QEMU_BINARY: ${{ matrix.qemu_binary }}
-          ELF_MAGIC: ${{ matrix.elf_magic }}
-          ELF_MASK: ${{ matrix.elf_mask }}
+          TARGET_ARCH: ${{ matrix.target_arch }}
+          RELEASE_MACHINE: ${{ matrix.release_machine }}
           FREEBSD_VERSION: ${{ matrix.freebsd_version }}
-          JAIL_NAME: ${{ matrix.jail_name }}
+          PORTS_BRANCH: ${{ steps.cfg.outputs.ports_branch }}
         with:
           operating_system: freebsd
-          version: '15.0'
-          # Conservative values -- the runner has 4 vCPU / 16 GB, but pushing
-          # higher triggered OOM-style cascade failures across parallel
-          # builders (USE_TMPFS=wrkdir + ALLOW_MAKE_JOBS compound the pressure).
-          memory: 6G
-          cpu_count: 2
+          architecture: x86-64
+          version: ${{ matrix.freebsd_version }}
+          memory: 12G
+          cpu_count: 4
           shell: sh
-          sync_files: true
-          # Skip graceful VM shutdown -- files are already synced back before
-          # post-run, and termination is faster and avoids known teardown
-          # freezes.
-          shutdown_vm: false
-          environment_variables: POUDRIERE_ARCH BINMISCCTL_NAME QEMU_BINARY ELF_MAGIC ELF_MASK FREEBSD_VERSION JAIL_NAME
-          run: sh scripts/build-packages.sh
-
-      # cross-platform-actions' rsync sync-back does not --delete, so any
-      # stale content that a dirty cache restored onto the runner survives
-      # even after collect-packages.sh cleans it inside the VM. Prune the
-      # workspace packages/ down to the same public subset here so the
-      # cache and the artifact tarball stay clean.
-      - name: Prune packages/ to public subset
-        if: ${{ always() && !inputs.mock_build }}
-        run: |
-          if [ -d packages ]; then
-              find packages -mindepth 1 -maxdepth 1 \
-                  ! -name All \
-                  ! -name Latest \
-                  ! -name meta.conf \
-                  ! -name meta \
-                  ! -name data.pkg \
-                  ! -name packagesite.pkg \
-                  -exec rm -rf {} +
-          fi
-
-      # Always save, even on timeout or failure, so partial progress is
-      # preserved. always() covers success, failure, and cancellation.
-      # Skipped for mock builds so they don't pollute the real cache.
-      - name: Save packages cache
-        if: ${{ always() && !inputs.mock_build }}
-        uses: actions/cache/save@v5
-        with:
-          path: packages
-          key: packages-${{ matrix.jail_name }}-${{ github.run_id }}
+          environment_variables: >-
+            TARGET_ARCH RELEASE_MACHINE FREEBSD_VERSION PORTS_BRANCH
+          # Runs as the unprivileged `runner` user (passwordless sudo). The
+          # working dir maps to GITHUB_WORKSPACE, and the bidirectional sync
+          # is what carries the built repository back out.
+          run: |
+            set -eux
+            WORKSPACE="$PWD" sh scripts/cross-build.sh
 
       # Tarball the site directory. actions/upload-artifact rejects paths
       # containing colons (Windows filesystem compat), but pkg clients
-      # require ABI paths like FreeBSD:15:riscv64. The final pages artifact
+      # require ABI paths like FreeBSD:15:powerpc64. The final pages artifact
       # is itself a tarball and does preserve colons, so we only need to
       # work around the intermediate upload/download step.
       - name: Prepare site tarball
         run: |
-          abi_dir="FreeBSD:${{ matrix.major_version }}:${{ matrix.binmiscctl_name }}"
+          abi_dir="FreeBSD:${{ matrix.major_version }}:${{ matrix.target_arch }}"
           mkdir -p "_site/$abi_dir"
           cp -R packages/. "_site/$abi_dir/"
           tar -C _site -czf site.tar.gz .
@@ -156,12 +129,14 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: site-${{ matrix.binmiscctl_name }}-${{ matrix.freebsd_version }}
+          name: site-${{ matrix.build_name }}
           path: site.tar.gz
 
   deploy:
     name: Deploy to GitHub Pages
     needs: build
+    # A branch push validates the build; only master publishes.
+    if: ${{ github.ref == 'refs/heads/master' }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages

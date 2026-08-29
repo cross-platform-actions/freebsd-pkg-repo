@@ -1,0 +1,3 @@
+# The FreeBSD ports branch to build from. A quarterly branch keeps the build
+# reproducible; `main` would move under us between runs.
+2026Q3

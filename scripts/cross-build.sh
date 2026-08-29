@@ -93,6 +93,16 @@ NOARCH_ABI="FreeBSD:${MAJOR_VERSION}:*"
 TRIPLE="${TARGET_ARCH}-unknown-freebsd${FREEBSD_VERSION}"
 CROSS_TOOLCHAIN="${TARGET_ARCH}-clang"
 
+# readelf's `Machine:` line for this target. Used twice: to smoke-test the
+# toolchain before anything is built, and to prove every packaged binary really
+# is for the target. An unlisted arch skips both checks rather than failing.
+case "$TARGET_ARCH" in
+    riscv64)                 ELF_MACHINE="RISC-V" ;;
+    powerpc64|powerpc64le)   ELF_MACHINE="PowerPC64" ;;
+    aarch64)                 ELF_MACHINE="AArch64" ;;
+    *)                       ELF_MACHINE="" ;;
+esac
+
 SYSROOT="$HOME/sysroot.$TARGET_ARCH"
 TARGET_LOCALBASE="$SYSROOT/usr/local"
 PORTSDIR="$HOME/ports"
@@ -184,11 +194,38 @@ sudo chown -R "$(id -u):$(id -g)" "$SYSROOT"
 # `pkg install freebsd-gcc13-<arch>` plus CROSS_TOOLCHAIN=<arch>-gcc13, which
 # installs an equivalent file naming a real prefixed cross binutils.
 echo "===== WRITING CROSS TOOLCHAIN ($CROSS_TOOLCHAIN) ====="
+
+# The compiler is exposed as three wrapper scripts rather than as
+# "cc -target ... --sysroot=...", because a compiler variable carrying
+# arguments is not portable across build systems: cmake rejects it outright
+# ("The CMAKE_C_COMPILER ... is not a full path to an existing compiler tool"),
+# which is what killed archivers/brotli and security/libssh2. A single argv[0]
+# that any build system can exec keeps cmake, meson and autotools all happy.
+#
+# Baking --sysroot into the wrapper has a second benefit: bsd.port.mk would
+# otherwise append it to CC itself, putting the build machine's sysroot path
+# into every configure line and every recorded CFLAGS string.
+#
+# The wrappers live in the host prefix (they are amd64 programs, and this is
+# where devel/freebsd-gcc13 would install its equivalents), never in the
+# sysroot, so their path is meaningful wherever it is recorded.
+CROSS_BINDIR=/usr/local/bin
+for _pair in "cc:cc" "c++:c++" "cpp:cpp"; do
+    _name="${_pair%%:*}"
+    _base="${_pair#*:}"
+    sudo sh -c "cat > ${CROSS_BINDIR}/${TRIPLE}-${_name}" <<EOF
+#!/bin/sh
+exec /usr/bin/${_base} -target ${TRIPLE} --sysroot=${SYSROOT} "\$@"
+EOF
+    sudo chmod 755 "${CROSS_BINDIR}/${TRIPLE}-${_name}"
+done
+"${CROSS_BINDIR}/${TRIPLE}-cc" --version | head -n 1
+
 mkdir -p "$TARGET_LOCALBASE/share/toolchains"
 cat > "$TARGET_LOCALBASE/share/toolchains/${CROSS_TOOLCHAIN}.mk" <<EOF
-XCC=/usr/bin/cc -target ${TRIPLE}
-XCXX=/usr/bin/c++ -target ${TRIPLE}
-XCPP=/usr/bin/cpp -target ${TRIPLE}
+XCC=${CROSS_BINDIR}/${TRIPLE}-cc
+XCXX=${CROSS_BINDIR}/${TRIPLE}-c++
+XCPP=${CROSS_BINDIR}/${TRIPLE}-cpp
 CROSS_BINUTILS_PREFIX=/usr/bin/
 X_COMPILER_TYPE=clang
 EOF
@@ -231,7 +268,24 @@ BATCH=yes"
 # Kept out of CROSS_ARGS because its value contains spaces: CROSS_ARGS is
 # deliberately word-split onto the make command line, so this one has to be
 # passed as a single quoted argument instead.
-CROSS_AS="AS=/usr/bin/cc -target $TRIPLE --sysroot=$SYSROOT -c"
+CROSS_AS="AS=$CROSS_BINDIR/$TRIPLE-cc -c"
+
+# bsd.port.mk builds CC as `${XCC} --sysroot=${CROSS_SYSROOT}`, which reasserts
+# the arguments-in-a-compiler-variable problem the wrappers exist to avoid. The
+# wrappers already carry -target and --sysroot, so pin the compiler variables
+# to them directly; a command-line assignment wins over the makefile's.
+#
+# HOSTCC/HOSTCXX must be pinned in the same breath. bsd.port.mk seeds them from
+# CC (`.if !defined(HOSTCC)` / `HOSTCC:= ${CC}`) before it reassigns CC to the
+# cross compiler, so overriding CC without them would make the *native* build
+# compiler -- the one CC_FOR_BUILD hands to configure for host-side codegen
+# tools -- point at the cross compiler.
+CROSS_COMPILER_ARGS="CC=$CROSS_BINDIR/$TRIPLE-cc \
+CXX=$CROSS_BINDIR/$TRIPLE-c++ \
+CPP=$CROSS_BINDIR/$TRIPLE-cpp \
+HOSTCC=/usr/bin/cc \
+HOSTCXX=/usr/bin/c++"
+CROSS_ARGS="$CROSS_ARGS $CROSS_COMPILER_ARGS"
 
 # Repointing LOCALBASE at the sysroot breaks every HOST tool the ports
 # framework resolves as ${LOCALBASE}/bin/<tool>: those are amd64 programs that
@@ -337,8 +391,8 @@ assert_var() {  # $1=VARNAME  $2=expected substring
     esac
 }
 assert_var ARCH "$TARGET_ARCH"
-assert_var CC "-target $TRIPLE"
-assert_var CC "--sysroot=$SYSROOT"
+assert_var CC "$TRIPLE-cc"
+assert_var HOSTCC /usr/bin/cc
 assert_var CROSS_HOST "$TRIPLE"
 assert_var LOCALBASE "$TARGET_LOCALBASE"
 assert_var PREFIX /usr/local
@@ -363,6 +417,23 @@ for _tool in ar ld nm objcopy ranlib size strings strip; do
         { echo "FATAL: /usr/bin/$_tool is missing from the build host" >&2
           exit 1; }
 done
+
+# The assertions above only prove the variables SAY the right thing. Actually
+# compile and link something and look at what came out -- it is a couple of
+# seconds, and it is the difference between "configured for the target" and
+# "produces target binaries".
+echo "===== TOOLCHAIN SMOKE TEST ====="
+_probe_dir="$(mktemp -d -t xbuild-probe)"
+echo 'int main(void) { return 0; }' > "$_probe_dir/t.c"
+"$CROSS_BINDIR/$TRIPLE-cc" -o "$_probe_dir/t" "$_probe_dir/t.c"
+_probe_machine="$(readelf -h "$_probe_dir/t" | sed -n 's/^ *Machine: *//p')"
+echo "linked a test binary for: $_probe_machine"
+case "$_probe_machine" in
+    *"$ELF_MACHINE"*) : ;;
+    *) echo "FATAL: the cross toolchain produced a [$_probe_machine] binary," \
+            "expected [$ELF_MACHINE]" >&2; exit 1 ;;
+esac
+rm -rf "$_probe_dir"
 echo "cross-config OK (OSVERSION $_want_osversion, read from the sysroot)"
 
 # --- 6. Classify and order the dependency closure ---------------------------
@@ -480,16 +551,6 @@ fi
 # directly rather than `pkg -r $SYSROOT add` avoids arguing pkg out of its ABI
 # check for no benefit -- nothing here reads the target's package database.
 
-# readelf's `Machine:` line for each target, used to prove the packaged
-# binaries really are for the target. An unlisted arch skips the check rather
-# than failing it.
-case "$TARGET_ARCH" in
-    riscv64)                 ELF_MACHINE="RISC-V" ;;
-    powerpc64|powerpc64le)   ELF_MACHINE="PowerPC64" ;;
-    aarch64)                 ELF_MACHINE="AArch64" ;;
-    *)                       ELF_MACHINE="" ;;
-esac
-
 # manifest_deps ORIGIN -> the dependency block for ORIGIN's package manifest,
 # in the `"name": {origin: "o", version: "v"}` form create-manifest.sh expects
 # from ACTUAL-PACKAGE-DEPENDS. Direct dependencies only; pkg walks the graph
@@ -555,7 +616,21 @@ for origin in $build_order; do
     # target -- fail rather than publish it.
     if grep -rl "$SYSROOT" "$staged" 2>/dev/null | grep -q .; then
         echo "FATAL: $origin leaked the sysroot path into its package:" >&2
-        grep -rl "$SYSROOT" "$staged" >&2 || true
+        # Say HOW it leaked, not just that it did. A path recorded in an ELF
+        # RUNPATH is a broken library search at runtime and has to be fixed at
+        # link time; the same path sitting in a .pc file or a recorded CFLAGS
+        # string is a text substitution. The two need different fixes, and
+        # without this the log cannot tell them apart.
+        grep -rl "$SYSROOT" "$staged" 2>/dev/null |
+        while IFS= read -r bad; do
+            echo "  --- ${bad#$staged} ---" >&2
+            if head -c 4 "$bad" 2>/dev/null | grep -q 'ELF'; then
+                readelf -d "$bad" 2>/dev/null |
+                    grep -E 'RPATH|RUNPATH' >&2 || echo "    (no RPATH/RUNPATH)" >&2
+            fi
+            strings -a "$bad" 2>/dev/null | grep -F "$SYSROOT" | head -n 3 |
+                sed 's/^/    /' >&2 || true
+        done
         failed="$failed $origin(sysroot-leak)"
         rm -rf "$staged"
         continue

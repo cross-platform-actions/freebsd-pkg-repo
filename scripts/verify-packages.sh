@@ -42,15 +42,17 @@ echo "pkg ABI: $ABI"
     { echo "FATAL: guest ABI is [$ABI], packages are FreeBSD:15:riscv64" >&2
       exit 1; }
 
-# --- 2. Point pkg at this repository, and ONLY at it ------------------------
-# The stock FreeBSD repository is disabled so nothing can be silently satisfied
-# from elsewhere -- there is no official riscv64 ports repository anyway, so
-# leaving it enabled would only make `pkg update` fail.
+# --- 2. Add this repository, and scope every operation to it ----------------
+# Every pkg call below is restricted with `-r crossbuilt` rather than by
+# disabling the guest's own repositories. Two of those cannot work here and
+# would otherwise fail the run: FreeBSD-ports 404s because no official riscv64
+# ports repository exists, and the image already ships a `custom` repository
+# pointing at THIS project's Pages URL -- which is the empty directory a
+# terminated build left behind. Scoping also keeps the test honest about where
+# the packages came from, without depending on repository names the image is
+# free to change.
 echo "===== CONFIGURING REPOSITORY ====="
 sudo mkdir -p /usr/local/etc/pkg/repos
-sudo sh -c 'cat > /usr/local/etc/pkg/repos/FreeBSD.conf' <<'EOF'
-FreeBSD: { enabled: no }
-EOF
 sudo sh -c "cat > /usr/local/etc/pkg/repos/crossbuilt.conf" <<EOF
 crossbuilt: {
     url: "file://${REPO_DIR}",
@@ -58,7 +60,7 @@ crossbuilt: {
     signature_type: "none"
 }
 EOF
-sudo pkg update -f
+sudo pkg update -f -r crossbuilt
 
 # What the catalogue offers, which also proves packagesite.pkg parses.
 echo "===== CATALOGUE ====="
@@ -84,7 +86,11 @@ fi
 # -f forces reinstall even when the image already has the same version, so the
 # binaries under test are definitely ours.
 echo "===== INSTALLING ====="
-sudo pkg install -y -f -r crossbuilt $PKGS
+# -f reinstalls even when the image already has the same version, so the
+# binaries under test are definitely ours. -U suppresses the automatic
+# catalogue refresh, which would drag in the guest's unreachable repositories
+# and fail the install for reasons that have nothing to do with these packages.
+sudo pkg install -y -U -f -r crossbuilt $PKGS
 
 echo "===== INSTALLED FROM ====="
 for p in $PKGS; do
@@ -94,9 +100,13 @@ for p in $PKGS; do
         { echo "FATAL: $p came from [$_repo], not this repository" >&2; exit 1; }
 done
 
-# Every dependency of every installed package must be present and registered.
+# Every dependency our packages declare must be present and registered. Scoped
+# to our own packages: `-a` would also judge whatever else the image ships, and
+# fail this test for something that is not ours.
 echo "===== DEPENDENCY CHECK ====="
-sudo pkg check -d -a
+for p in $PKGS; do
+    sudo pkg check -d "$p"
+done
 
 # --- 5. Actually run them ---------------------------------------------------
 # The whole point: cross-compiled binaries that link and install can still be

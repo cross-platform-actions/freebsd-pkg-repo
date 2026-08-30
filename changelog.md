@@ -21,8 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin the ports tree to a quarterly branch so builds are reproducible
 - Target FreeBSD 15.0 packages
 - Validate every package before publishing: assert the cross configuration
-    resolves to the target before building, reject any package that leaks the
-    sysroot path, and check each ELF's machine type and each package's ABI
+    resolves to the target before building, smoke-test the toolchain by
+    compiling and linking a binary, translate staged sysroot paths into their
+    target equivalents, reject any package that still leaks one, and check each
+    ELF's machine type and each package's ABI
+- Generate each package's dependency metadata from the resolved closure, since
+    the ports framework derives it by asking the build host's pkg database,
+    which knows nothing of the target libraries in the sysroot
+- Supply the cross configuration the ports framework lacks for cmake and meson,
+    and carry the handful of per-port workarounds cross-compiling requires
+    (see the readme)
 - Build on pushes to any branch, so a change can be validated without
     publishing; only `master` deploys
 

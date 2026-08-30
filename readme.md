@@ -89,18 +89,22 @@ passwordless `sudo`). `scripts/cross-build.sh` orchestrates it:
    target's `/usr/include`, `/usr/lib` and `/bin/sh` — the last of which is
    what `bsd.port.mk` reads to stamp each package's ABI. There is no toolchain
    to build, so nothing here is worth caching.
-2. **Toolchain.** A five-line `share/toolchains/<arch>-clang.mk` is written
-   into the target prefix, pointing `XCC`/`XCXX`/`XCPP` at base clang with
-   `-target <arch>-unknown-freebsd<version>`. Base clang is already a cross
-   compiler and base's `ar`/`ld`/`nm`/`objcopy`/`ranlib`/`strip` are the
-   multi-target LLVM ones, so nothing needs installing. The one exception is
-   `AS`: FreeBSD dropped GNU `as` from base in 13, so it is overridden to the
-   compiler driver, which assembles through clang's integrated assembler.
+2. **Toolchain.** Three wrapper scripts —
+   `/usr/local/bin/<triple>-{cc,c++,cpp}` — are generated, each exec'ing base
+   clang with `-target`, `--sysroot` and the target prefix's include and
+   library paths. Base clang is already a cross compiler and base's
+   `ar`/`ld`/`nm`/`objcopy`/`ranlib`/`strip` are the multi-target LLVM ones, so
+   nothing needs installing. A matching `share/toolchains/<arch>-clang.mk`
+   names them for `bsd.port.mk`. `AS` is overridden to the compiler driver:
+   FreeBSD dropped GNU `as` from base in 13, so `/usr/bin/as` does not exist.
 3. **Ports tree.** The pinned quarterly branch is fetched as a tarball with
    base `fetch(1)` (no git needed).
-4. **Closure.** The dependency graph is resolved and split by kind, then each
-   target port is built in topological order with `make package`.
-5. **Publish.** `pkg repo` builds the repository metadata over the resulting
+4. **Cross configuration.** `Mk/bsd.local.mk` is written with the settings that
+   have to be *appended* to framework variables, and a meson cross-file is
+   generated (see below).
+5. **Closure.** The dependency graph is resolved and split by kind, then each
+   target port is staged, translated and packaged in topological order.
+6. **Publish.** `pkg repo` builds the repository metadata over the resulting
    packages, and the tree is pulled back to the runner for the deploy job.
 
 ### How cross-compiling ports actually works, and what it costs
@@ -120,21 +124,37 @@ cross-build `pkgconf` for powerpc64 and then try to execute it.
 
 [SoC2019 PortsSeparatedBuild]: https://wiki.freebsd.org/SummerOfCode2019Projects/PortsSeparatedBuild
 
-Three things follow from that, and they are the whole design:
+Four things follow from that, and they are the whole design:
 
-**Two prefixes, kept apart.**
+**Two prefixes, and `LOCALBASE` is left alone.**
 
 | | Path | Holds |
 |---|---|---|
 | Host prefix | `/usr/local` | amd64 build tools, plain `pkg install` from the official mirror, reached via `PATH` |
-| Target prefix | `$SYSROOT/usr/local` | cross-built target libraries and headers — this is what `LOCALBASE` points at |
+| Target prefix | `$SYSROOT/usr/local` | cross-built target libraries and headers |
 
-`LOCALBASE` has to point into the sysroot because `USES=localbase` emits
-`-isystem ${LOCALBASE}/include` and `-L${LOCALBASE}/lib`; left at `/usr/local`
-those resolve to *amd64* headers and libraries. `PREFIX` is then pinned back to
-`/usr/local` so the produced package still installs to the right place on the
-target — without it, `PREFIX?=${LOCALBASE}` would bake the sysroot path into
-every package.
+It is tempting to point `LOCALBASE` at the target prefix, since `USES=localbase`
+emits `-isystem ${LOCALBASE}/include`. Doing so is wrong. Ports use `LOCALBASE`
+as a **target runtime** path, not merely a build-time search path:
+`shells/bash` compiles it into its default `PATH` and into the locations of
+`profile` and `inputrc`, so that build shipped a bash whose `PATH` pointed at
+the build machine's sysroot. The same assumption runs through
+`USES=shebangfix`, the ~57 host tool paths in `bsd.commands.mk` and `Mk/Uses`
+(`PKG_BIN`, `CMAKE_BIN`, `AUTORECONF`, `PERL`, …), and libtool's idea of where
+a library will live.
+
+`/usr/local` is simultaneously where the host's tools are and where the
+target's own prefix lives at runtime, so leaving `LOCALBASE` alone makes all of
+those correct at once. The target prefix instead reaches the compiler **inside
+the wrapper scripts**, which carry `-isystem` and `-L` for it internally.
+Keeping them out of `CFLAGS`/`LDFLAGS` keeps the sysroot path out of configure
+lines, recorded build strings and generated `.pc` files — and out of libtool's
+`-L` bookkeeping, which hardcodes a `RUNPATH` for any `-L` directory it does
+not recognise as a system one.
+
+The wrappers withhold `-L` from compile-only invocations: clang reports an
+unused `-L` as a warning and meson promotes exactly that to an error in every
+compiler probe it runs.
 
 **The closure is driven by the script, not the framework.** Each port's direct
 `LIB_DEPENDS`/`RUN_DEPENDS` are target dependencies and get cross-built;
@@ -155,19 +175,58 @@ an empty list — `pkg install bash` on the target would not pull in
 `ACTUAL-PACKAGE-DEPENDS` with a list built from the closure it already
 resolved.
 
+**Some settings can only be appended, and only late.** `cmake.mk` and
+`meson.mk` have *no* cross support at all, so both build systems probe the
+build host — cmake linked the host's amd64 `libz`, and meson executed a target
+binary for its own sanity check. Their settings arrive through variables the
+framework accumulates with `+=`, which a make command line would *replace*, and
+`cmake.mk` runs cmake under `env -i`, so an exported `CMAKE_TOOLCHAIN_FILE`
+would not survive either.
+
+`/etc/make.conf` is read *before* the port's Makefile, which is too early: both
+`dns/libpsl` (`MESON_ARGS=`) and `security/sudo` (`CONFIGURE_ARGS=`) open with
+a plain `=` that discards anything appended earlier. The settings therefore
+live in `Mk/bsd.local.mk`, which `bsd.port.mk` includes under `USE_LOCAL_MK`,
+guarded on `_POSTMKINCLUDED` so it takes the inclusion that happens *after* the
+port Makefile has been read.
+
+### Ports that need help
+
+Cross-compiling exposes assumptions individual ports make about the build host.
+The following are carried in `Mk/bsd.local.mk` or as make variables, and each
+is a symptom of the framework's missing cross support rather than a bug in the
+port:
+
+| Port | Problem | Fix |
+|------|---------|-----|
+| `archivers/liblz4` | Builds an HTML manual by compiling `gen_manual` *for the target* and executing it on the host | `ALL_TARGET=allmost` — upstream's "all but the manuals" |
+| `security/sudo` | Its configure adds its own `-R<libdir>` | `--disable-rpath` |
+| `ftp/curl` | `ssl.mk` and `gssapi.mk` hardcode `/usr`, putting the host's amd64 base headers ahead of the sysroot's | `OPENSSLINC` and `KRB5_HOME` redirected into the sysroot |
+| `net/rsync` | Its configure wants a bare `python3`; the closure only installs a versioned interpreter | also install `lang/python3` |
+
 ### Guardrails
 
-Because the two-prefix split is the fragile part, the script checks its own
+Because the sysroot boundary is the fragile part, the script checks its own
 work rather than trusting it:
 
-- An **early assertion**, before any build, resolves `ARCH`, `CC`,
-  `CROSS_HOST`, `LOCALBASE`, `PREFIX` and `OSVERSION` and requires each to name
-  the *target*. A mis-wired `CROSS_*` fails in seconds instead of after a long
-  build.
-- Every packaged file is **grepped for the sysroot path**. If a port baked
-  `${LOCALBASE}` into its output, the package carries an absolute
-  `$SYSROOT/...` path that means nothing on the target — that fails the build
-  rather than getting published.
+- An **early assertion**, before any build, resolves `ARCH`, `CC`, `HOSTCC`,
+  `CROSS_HOST`, `LOCALBASE`, `PREFIX`, `PKG_BIN`, `PKG_CONFIG_LIBDIR`,
+  `OSVERSION` and the `CMAKE_ARGS`/`MESON_ARGS` appends, and requires each to
+  name the *target* (or, for the host tools, the host). Every one of these has
+  failed silently at least once, `LOCALBASE` and the `bsd.local.mk` appends
+  most expensively.
+- The toolchain is **smoke-tested**: a trivial program is compiled and linked
+  and its ELF machine checked, so "configured for the target" is never confused
+  with "produces target binaries".
+- Between staging and packaging, sysroot paths in **text** files are rewritten
+  to the paths they will have on the target. `$SYSROOT/usr` *is* `/usr` there,
+  so this is the standard sysroot-to-target translation — `libssh2.pc` records
+  the directory cmake found OpenSSL in, and needs it.
+- Every packaged file is then **grepped for the sysroot path**. Anything left
+  is inside a binary — a `RUNPATH` or a compiled-in constant — which cannot be
+  rewritten safely and is broken on the target, so it fails the build. When it
+  fires it reports `readelf -d` and `strings` context, because a `RUNPATH` and
+  a recorded build string need completely different fixes.
 - Every ELF in every package is checked with `readelf` for the **target's
   machine type**, and every package's recorded **ABI** must be
   `FreeBSD:<major>:<arch>`.

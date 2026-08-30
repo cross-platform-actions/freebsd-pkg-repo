@@ -137,11 +137,75 @@ jobs:
           name: site-${{ matrix.build_name }}
           path: site.tar.gz
 
+  # Everything in `build` proves the packages were assembled correctly. Only
+  # this proves they RUN. riscv64 is the only target with a published guest
+  # image (there is no powerpc64 one -- much of why its packages are wanted),
+  # and both are produced by the identical pipeline, so a pass here is strong
+  # evidence for powerpc64 without being proof of it.
+  #
+  # The guest is emulated: riscv64 on an x86-64 runner gets no KVM, so this is
+  # slow in a way the cross-build itself deliberately is not. It only installs
+  # packages and runs them, so slow is affordable.
+  verify:
+    name: Verify riscv64 packages on a real target
+    needs: build
+    # A mock build produces placeholder files, not packages; there is nothing
+    # to install and nothing to learn from trying.
+    if: ${{ !inputs.mock_build }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download riscv64 packages
+        uses: actions/download-artifact@v8
+        with:
+          name: site-riscv64-150
+          path: artifact
+
+      # The artifact is a tarball because upload-artifact rejects the colons in
+      # an ABI path. Unpack it to a colon-free directory: it becomes a file://
+      # URL inside the guest, and there is no reason to make pkg parse that.
+      - name: Unpack into a pkg repository
+        run: |
+          mkdir -p site pkgrepo
+          tar -xzf artifact/site.tar.gz -C site
+          cp -R "site/FreeBSD:15:riscv64/." pkgrepo/
+          ls -l pkgrepo pkgrepo/All | head -30
+
+      - name: Install and run the packages on FreeBSD/riscv64
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          architecture: riscv64
+          version: '15.0'
+          memory: 4G
+          cpu_count: 2
+          shell: sh
+          # REPO_DIR is resolved inside the guest rather than forwarded: the
+          # working directory maps to GITHUB_WORKSPACE, but its path there is
+          # not the runner's.
+          run: |
+            set -eux
+            REPO_DIR="$PWD/pkgrepo" sh scripts/verify-packages.sh
+
   deploy:
     name: Deploy to GitHub Pages
-    needs: build
-    # A branch push validates the build; only master publishes.
-    if: ${{ github.ref == 'refs/heads/master' }}
+    # Gated on verify as well as build: publishing packages that do not run is
+    # exactly the failure this repository exists to avoid. If the emulated
+    # guest ever becomes too flaky to gate on, drop `verify` from this list.
+    needs: [build, verify]
+    # A branch push validates the build; only master publishes. `verify` is
+    # skipped for a mock build, and a skipped dependency would otherwise block
+    # this job -- leaving the deploy path untestable, which is the one thing
+    # mock_build exists for. So require success from build, and success-or-
+    # skipped from verify.
+    if: >-
+      ${{ always()
+          && github.ref == 'refs/heads/master'
+          && needs.build.result == 'success'
+          && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
     runs-on: ubuntu-latest
     # Pages deploys must not overlap; builds may.
     concurrency:

@@ -131,7 +131,13 @@ sudo -V | head -n 1
 # That distinction is not academic: an earlier version of this test installed
 # only the leaf ports and passed while curl was reporting the image's
 # libpsl/0.21.5 against the 0.22.0 sitting unused in the repository.
+# pkg's version carries the port revision and epoch (0.22.0_1, 0.22.0,1);
+# curl reports the upstream version only. Strip both, or the first PORTREVISION
+# bump in the quarterly branch fails this gate -- and therefore the deploy --
+# for a reason unrelated to the packages.
 _want_psl="$(pkg query '%v' libpsl)"
+_want_psl="${_want_psl%%_*}"
+_want_psl="${_want_psl%%,*}"
 echo "libpsl in this repository: $_want_psl"
 curl --version | head -n 1 | grep -q "libpsl/$_want_psl" ||
     { echo "FATAL: curl did not load this repository's libpsl ($_want_psl)" >&2

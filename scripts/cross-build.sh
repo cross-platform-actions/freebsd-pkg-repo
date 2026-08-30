@@ -123,8 +123,16 @@ case "$TARGET_ARCH" in
         ELF_MACHINE="AArch64"
         MESON_CPU_FAMILY=aarch64; MESON_ENDIAN=little ;;
     *)
-        ELF_MACHINE=""
-        MESON_CPU_FAMILY="$TARGET_ARCH"; MESON_ENDIAN=little ;;
+        # Not "skip the checks": an empty ELF_MACHINE makes `case $m in
+        # *"$ELF_MACHINE"*` match ANYTHING, so the toolchain smoke test would
+        # PASS on an amd64 binary and the per-package arch check would wave
+        # every package through. Guessing MESON_ENDIAN=little would also be
+        # silently wrong for any big-endian target. Refuse instead.
+        echo "FATAL: $TARGET_ARCH is not in this script's architecture table." \
+             "Add its readelf machine name and meson cpu_family/endianness" \
+             "here -- defaulting them would disable the arch checks rather" \
+             "than skip them." >&2
+        exit 1 ;;
 esac
 
 SYSROOT="$HOME/sysroot.$TARGET_ARCH"
@@ -241,12 +249,29 @@ echo "===== WRITING CROSS TOOLCHAIN ($CROSS_TOOLCHAIN) ====="
 # does not recognise as a system directory, and was stamping
 # $SYSROOT/usr/lib into sudo's and libidn2's shared libraries.
 #
-# They come before "$@", so they win over the host's own /usr/local/include
-# that USES=localbase appends.
+# On the include side this beats the host's own /usr/local/include, which
+# USES=localbase appends -- but NOT because of command-line order. clang
+# searches every -I directory before any -isystem one regardless of position;
+# these win only because USES=localbase also emits -isystem, putting both in
+# the same class where order then decides. A port that puts
+# -I/usr/local/include in CPPFLAGS instead would take the host's amd64 headers
+# no matter where these sit. Nothing in the current package set does.
 CROSS_BINDIR=/usr/local/bin
-for _pair in "cc:cc" "c++:c++" "cpp:cpp"; do
-    _name="${_pair%%:*}"
-    _base="${_pair#*:}"
+for _name in cc c++ cpp; do
+    # cpp never links, and unlike the compilers it is not usually invoked with
+    # an explicit -c/-S/-E for the guard below to catch: autoconf runs
+    # `$CPP conftest.c`. Give it no -L at all, or AC_PROG_CPP's sanity check
+    # rejects it for emitting an unused-argument warning on stderr.
+    if [ "$_name" = cpp ]; then
+        sudo sh -c "cat > ${CROSS_BINDIR}/${TRIPLE}-${_name}" <<EOF
+#!/bin/sh
+exec /usr/bin/${_name} -target ${TRIPLE} --sysroot=${SYSROOT} \\
+    -isystem ${TARGET_LOCALBASE}/include "\$@"
+EOF
+        sudo chmod 755 "${CROSS_BINDIR}/${TRIPLE}-${_name}"
+        continue
+    fi
+    _base="$_name"
     sudo sh -c "cat > ${CROSS_BINDIR}/${TRIPLE}-${_name}" <<EOF
 #!/bin/sh
 # -L is withheld from compile-only invocations. clang reports an unused -L as
@@ -548,6 +573,10 @@ assert_var MESON_ARGS --cross-file=
 # against the value read straight out of the sysroot header.
 _want_osversion="$(awk '/^#define[[:blank:]]+__FreeBSD_version/ {print $3}' \
     "$SYSROOT/usr/include/sys/param.h")"
+# An empty expected value would make assert_var pass on anything.
+[ -n "$_want_osversion" ] ||
+    { echo "FATAL: could not read __FreeBSD_version from the sysroot" >&2
+      exit 1; }
 assert_var OSVERSION "$_want_osversion"
 
 # Every tool bsd.port.mk derives from CROSS_BINUTILS_PREFIX must actually
@@ -597,11 +626,24 @@ echo "cross-config OK (OSVERSION $_want_osversion, read from the sysroot)"
 # variables. Entries look like `libnghttp2.so:www/libnghttp2`,
 # `pkgconf>=1.3:devel/pkgconf` or `/usr/local/bin/foo:x/y:extract`; the origin
 # is always the second colon-separated field.
+#
+# The make invocation is checked rather than piped straight into the filter:
+# `set -e` does not fire for a failure inside a pipeline whose last stage
+# succeeds, so a failed -V would yield a silently TRUNCATED dependency list.
+# That is invisible and expensive -- the missing dependency is never visited,
+# never built, never installed into the sysroot, and never recorded in the
+# manifest, so the dependent port either fails to link much later or, if the
+# library also exists in base, links fine and ships a manifest missing it.
 dep_origins() {
     _origin="$1"; shift
+    _raw=""
     for _var in "$@"; do
-        cross_make "$_origin" -V "$_var"
-    done | tr ' ' '\n' | awk -F: 'NF >= 2 && $2 != "" { print $2 }' | sort -u
+        _one="$(cross_make "$_origin" -V "$_var")" ||
+            { echo "FATAL: could not read $_var for $_origin" >&2; exit 1; }
+        _raw="$_raw $_one"
+    done
+    printf '%s' "$_raw" | tr ' ' '\n' |
+        awk -F: 'NF >= 2 && $2 != "" { print $2 }' | sort -u
 }
 
 target_deps() { dep_origins "$1" LIB_DEPENDS RUN_DEPENDS; }
@@ -616,12 +658,27 @@ host_deps() {
 visited=""
 build_order=""
 host_tools=""
+# Origins on the current recursion stack. RUN_DEPENDS is followed for ordering
+# as well as for the closure, and run-dependency cycles are legal in ports (A
+# RUN_DEPENDS B while B LIB_DEPENDS A). `visited` alone stops such a cycle from
+# hanging, but it resolves it by silently emitting an order in which one member
+# precedes something it links against -- which surfaces much later as a link
+# failure with no hint that ordering caused it. Name it instead.
+in_progress=""
 
 visit() {  # $1 = origin
-    local origin dep deps
+    local origin dep deps meta
     origin="$1"
+    case " $in_progress " in
+        *" $origin "*)
+            echo "FATAL: dependency cycle reaching $origin --" \
+                 "stack:$in_progress. The build order that would come out of" \
+                 "this puts a port before something it links against." >&2
+            exit 1 ;;
+    esac
     case " $visited " in *" $origin "*) return 0 ;; esac
     visited="$visited $origin"
+    in_progress="$in_progress $origin"
 
     if [ ! -d "$(port_dir "$origin")" ]; then
         echo "FATAL: no such port origin: $origin" >&2
@@ -631,9 +688,22 @@ visit() {  # $1 = origin
     # Record this port's identity and its DIRECT target dependencies while we
     # are here. Both are needed in step 7 to write the manifest deps block, and
     # a make invocation per port is far cheaper than one per dependency edge.
-    printf '%s\t%s\n' "$origin" \
-        "$(cross_make "$origin" -V PKGBASE -V PKGORIGIN -V PKGVERSION |
-           tr '\n' '\t')" >> "$METAFILE"
+    #
+    # Captured into a variable first: as a command substitution inside printf's
+    # argument list the make status would be discarded entirely, and an empty
+    # result writes `"": {origin: "", version: ""}` -- a syntactically valid
+    # dependency entry naming nothing -- into a shipped package manifest.
+    meta="$(cross_make "$origin" -V PKGBASE -V PKGORIGIN -V PKGVERSION)" ||
+        { echo "FATAL: could not read package identity for $origin" >&2; exit 1; }
+    # Three -V queries must yield three non-empty lines. `grep -c .` counts
+    # only non-empty ones, so an empty PKGBASE or PKGVERSION is caught here
+    # rather than becoming an empty field in a manifest.
+    if [ "$(printf '%s\n' "$meta" | grep -c .)" -ne 3 ]; then
+        echo "FATAL: incomplete package identity for $origin: [$meta]" >&2
+        exit 1
+    fi
+    printf '%s\t%s\n' "$origin" "$(printf '%s' "$meta" | tr '\n' '\t')" \
+        >> "$METAFILE"
 
     deps="$(target_deps "$origin" | tr '\n' ' ')"
     printf '%s\t%s\n' "$origin" "$deps" >> "$MANIFEST_DEPS_DIR/edges"
@@ -643,6 +713,8 @@ visit() {  # $1 = origin
     done
     host_tools="$host_tools $(host_deps "$origin" | tr '\n' ' ')"
     build_order="$build_order $origin"
+    # Pop: only an origin still being expanded higher up the stack is a cycle.
+    in_progress="${in_progress% $origin}"
 }
 
 echo "===== RESOLVING DEPENDENCY CLOSURE ====="
@@ -651,8 +723,13 @@ mkdir -p "$MANIFEST_DEPS_DIR"
 : > "$METAFILE"
 requested=""
 while IFS= read -r origin || [ -n "$origin" ]; do
-    case "$origin" in ''|\#*) continue ;; esac
+    # Trim first, THEN test: `case` on the raw line only catches a '#' in
+    # column 1, so an indented comment survived it and `tr -d [:space:]` turned
+    # "  # note" into "#note" -- a fatal "no such port origin". The other two
+    # readers of this file (step 5's probe and the publish guard) both allow
+    # leading whitespace, so this one was also the odd one out.
     origin="$(printf '%s' "$origin" | tr -d '[:space:]')"
+    case "$origin" in ''|\#*) continue ;; esac
     [ -n "$origin" ] || continue
     requested="$requested $origin"
     visit "$origin"
@@ -707,10 +784,6 @@ command -v python3 || echo "WARNING: still no python3 on PATH" >&2
 # directly rather than `pkg -r $SYSROOT add` avoids arguing pkg out of its ABI
 # check for no benefit -- nothing here reads the target's package database.
 
-# manifest_deps ORIGIN -> the dependency block for ORIGIN's package manifest,
-# in the `"name": {origin: "o", version: "v"}` form create-manifest.sh expects
-# from ACTUAL-PACKAGE-DEPENDS. Direct dependencies only; pkg walks the graph
-# transitively from each package's own list.
 # dump_config_logs ORIGIN -- surface a configure failure in this run's log. A
 # cross-configure error ("cannot run C compiled programs", a missing target
 # library) is otherwise invisible without another CI round trip.
@@ -747,6 +820,10 @@ normalise_sysroot() {  # $1 = directory
     done
 }
 
+# manifest_deps ORIGIN -> the dependency block for ORIGIN's package manifest,
+# in the `"name": {origin: "o", version: "v"}` form create-manifest.sh expects
+# from ACTUAL-PACKAGE-DEPENDS. Direct dependencies only; pkg walks the graph
+# transitively from each package's own list.
 manifest_deps() {  # $1 = origin
     local origin dep
     origin="$1"
@@ -773,6 +850,20 @@ for origin in $build_order; do
     echo "manifest deps for $origin:"
     cat "$depfile"
 
+    # One line out per dependency edge in. A short depfile means an origin in
+    # `edges` had no matching row in METAFILE, and the package would ship
+    # missing a dependency it links against -- silently, which is the entire
+    # failure this override exists to prevent, so it must never be merely
+    # logged.
+    _want_deps="$(awk -F'\t' -v o="$origin" '$1 == o { print $2 }' \
+                      "$MANIFEST_DEPS_DIR/edges" | wc -w | tr -d ' ')"
+    _got_deps="$(grep -c . "$depfile" || true)"
+    if [ "$_want_deps" -ne "$_got_deps" ]; then
+        echo "FATAL: $origin has $_want_deps target dependencies but only" \
+             "$_got_deps manifest entries were generated" >&2
+        exit 1
+    fi
+
     # Stage and package are run as separate steps so the staged tree can be
     # rewritten in between -- see normalise_sysroot below.
     if ! cross_make "$origin" stage NO_DEPENDS=yes \
@@ -797,7 +888,15 @@ for origin in $build_order; do
     # an ELF file is a RUNPATH or a compiled-in constant, which cannot be
     # safely rewritten and must fail the build instead. The check below still
     # enforces that.
-    normalise_sysroot "$(cross_make "$origin" -V STAGEDIR)"
+    # Checked, not inlined: a failed -V yields "", and normalise_sysroot
+    # returns 0 on a non-existent directory, so the rewrite would be skipped in
+    # silence and the port would ship whatever sysroot paths it staged.
+    stagedir="$(cross_make "$origin" -V STAGEDIR)" ||
+        { echo "FATAL: could not read STAGEDIR for $origin" >&2; exit 1; }
+    [ -d "$stagedir" ] ||
+        { echo "FATAL: STAGEDIR for $origin does not exist: [$stagedir]" >&2
+          exit 1; }
+    normalise_sysroot "$stagedir"
 
     if ! cross_make "$origin" package NO_DEPENDS=yes \
             "ACTUAL-PACKAGE-DEPENDS=cat $depfile"; then

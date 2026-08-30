@@ -26,25 +26,59 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PKGLIST="$REPO_ROOT/config/pkglist"
+ARCH_FILE="$REPO_ROOT/config/architectures"
+VERSIONS_FILE="$REPO_ROOT/config/versions"
 
 [ -d _site ] || { echo "FATAL: no _site directory to verify" >&2; exit 1; }
+
+# strip_comments FILE -- the shared filter for the plain-text config lists.
+strip_comments() {
+    grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$'
+}
+
+# Which ABI directories MUST be present. Counting the ones that happen to exist
+# is not enough: an arch dropped from config/architectures, or a matrix leg
+# that produced no artifact for any reason short of a job failure, would leave
+# a smaller site that then replaces the whole published one -- the exact wipe
+# this file exists to prevent, and which an earlier version of it let through
+# because it only required at least one directory.
+expected_abis=""
+while IFS= read -r version; do
+    [ -n "$version" ] || continue
+    major="${version%%.*}"
+    while IFS= read -r arch_line; do
+        [ -n "$arch_line" ] || continue
+        arch="$(echo "$arch_line" | awk '{print $1}')"
+        expected_abis="$expected_abis FreeBSD:${major}:${arch}"
+    done <<EOF
+$(strip_comments "$ARCH_FILE")
+EOF
+done <<EOF
+$(strip_comments "$VERSIONS_FILE")
+EOF
+
+[ -n "$expected_abis" ] ||
+    { echo "FATAL: config/architectures x config/versions is empty" >&2; exit 1; }
+echo "expecting:$expected_abis"
 
 # The package name a port origin produces is not always its directory name, but
 # it is for everything this repository builds, and the alternative -- shipping
 # the expected names out of the guest -- would put a private file in the
 # published tree. A mismatch fails loudly here rather than silently publishing
 # a set that is missing something, which is the behaviour we want either way.
-expected="$(grep -v '^[[:space:]]*#' "$PKGLIST" | grep -v '^[[:space:]]*$' |
-            sed -e 's|.*/||' -e 's|@.*||')"
+expected="$(strip_comments "$PKGLIST" | sed -e 's|.*/||' -e 's|@.*||')"
 
 status=0
-abi_count=0
 
-for dir in _site/FreeBSD:*:*; do
-    [ -d "$dir" ] || continue
-    abi_count=$((abi_count + 1))
-    abi="$(basename "$dir")"
+for abi in $expected_abis; do
+    dir="_site/$abi"
     echo "===== verifying $abi ====="
+    if [ ! -d "$dir" ]; then
+        echo "FATAL: $abi is configured but absent from the site;" \
+             "deploying would remove it from the published repository" >&2
+        status=1
+        continue
+    fi
 
     # pkg needs the catalogue and the repository metadata. `pkg repo` writes
     # meta.conf on this version; accept `meta` too rather than pin the guard to
@@ -69,24 +103,27 @@ for dir in _site/FreeBSD:*:*; do
     # Every requested origin must be present. The version is required to start
     # with a digit so that a name is not matched by a longer one (pkg- must not
     # be satisfied by pkgconf-).
+    # A NON-EMPTY package must exist. Testing only for existence would accept a
+    # zero-byte file, which is the shape a truncated or interrupted copy leaves
+    # behind -- and every other check here already uses -s.
     for name in $expected; do
-        if ls "$dir"/All/"$name"-[0-9]*.pkg >/dev/null 2>&1; then
-            echo "  OK: $name"
+        found=""
+        for pkgfile in "$dir"/All/"$name"-[0-9]*.pkg; do
+            [ -s "$pkgfile" ] && found="$pkgfile" && break
+        done
+        if [ -n "$found" ]; then
+            echo "  OK: $name ($(basename "$found"))"
         else
-            echo "FATAL: $abi has no package for requested origin '$name'" >&2
+            echo "FATAL: $abi has no non-empty package for requested origin" \
+                 "'$name'" >&2
             status=1
         fi
     done
 done
 
-if [ "$abi_count" -eq 0 ]; then
-    echo "FATAL: _site contains no FreeBSD:<major>:<arch> directory --" \
-         "deploying this would empty the repository" >&2
-    status=1
-fi
-
 if [ "$status" -ne 0 ]; then
     echo "===== REFUSING TO DEPLOY: the package set is incomplete =====" >&2
     exit 1
 fi
-echo "===== OK: $abi_count package set(s) verified, safe to deploy ====="
+echo "===== OK: every configured package set verified, safe to deploy:" \
+     "$expected_abis ====="

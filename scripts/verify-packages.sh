@@ -86,14 +86,21 @@ fi
 # -f forces reinstall even when the image already has the same version, so the
 # binaries under test are definitely ours.
 echo "===== INSTALLING ====="
+# EVERY package in the repository, not just the four leaf ports. Installing
+# only those leaves their dependencies satisfied by whatever the image already
+# has, so the libraries actually loaded at runtime are not the ones under test
+# -- the first version of this check passed while curl reported libpsl/0.21.5,
+# the image's copy, against the 0.22.0 we had just built.
+ALL_PKGS="$(pkg rquery -r crossbuilt '%n' | sort)"
+echo "installing: $(echo $ALL_PKGS | tr '\n' ' ')"
 # -f reinstalls even when the image already has the same version, so the
 # binaries under test are definitely ours. -U suppresses the automatic
 # catalogue refresh, which would drag in the guest's unreachable repositories
 # and fail the install for reasons that have nothing to do with these packages.
-sudo pkg install -y -U -f -r crossbuilt $PKGS
+sudo pkg install -y -U -f -r crossbuilt $ALL_PKGS
 
 echo "===== INSTALLED FROM ====="
-for p in $PKGS; do
+for p in $ALL_PKGS; do
     pkg query '%n %v (from %R)' "$p"
     _repo="$(pkg query '%R' "$p")"
     [ "$_repo" = crossbuilt ] ||
@@ -104,7 +111,7 @@ done
 # to our own packages: `-a` would also judge whatever else the image ships, and
 # fail this test for something that is not ours.
 echo "===== DEPENDENCY CHECK ====="
-for p in $PKGS; do
+for p in $ALL_PKGS; do
     sudo pkg check -d "$p"
 done
 
@@ -119,6 +126,18 @@ sudo -V | head -n 1
 
 # Something slightly more than --version: bash actually interpreting a script,
 # and curl exercising its TLS and compression stack against a real host.
+# curl reports its dependencies' versions at RUNTIME, so this proves it loaded
+# the libraries from this repository rather than the ones the image shipped.
+# That distinction is not academic: an earlier version of this test installed
+# only the leaf ports and passed while curl was reporting the image's
+# libpsl/0.21.5 against the 0.22.0 sitting unused in the repository.
+_want_psl="$(pkg query '%v' libpsl)"
+echo "libpsl in this repository: $_want_psl"
+curl --version | head -n 1 | grep -q "libpsl/$_want_psl" ||
+    { echo "FATAL: curl did not load this repository's libpsl ($_want_psl)" >&2
+      exit 1; }
+echo "curl is linked against this repository's libpsl"
+
 bash -c 'set -e; x=0; for i in 1 2 3; do x=$((x + i)); done; [ "$x" = 6 ] && echo "bash arithmetic OK"'
 curl -fsS --max-time 60 https://www.freebsd.org/ -o /dev/null && echo "curl HTTPS OK"
 rsync -a --version >/dev/null && echo "rsync OK"

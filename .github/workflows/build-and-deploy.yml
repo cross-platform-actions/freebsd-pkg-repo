@@ -69,14 +69,17 @@ jobs:
         if: ${{ inputs.mock_build }}
         run: |
           mkdir -p packages/All packages/Latest
+          # One package per origin in config/pkglist, so the mock exercises the
+          # publish guard rather than tripping it.
           for p in bash-5.3.9 sudo-1.9.17p2_2 curl-8.19.0_2 rsync-3.4.1_7 pkg-2.7.4; do
-              : > "packages/All/${p}.pkg"
+              echo mock > "packages/All/${p}.pkg"
           done
-          : > packages/Latest/pkg.pkg
-          : > packages/meta.conf
-          : > packages/meta
-          : > packages/data.pkg
-          : > packages/packagesite.pkg
+          echo mock > packages/Latest/pkg.pkg
+          # Non-empty: the guard requires a usable-looking repository, and an
+          # empty catalogue is exactly the failure it exists to catch.
+          for f in meta.conf meta data.pkg packagesite.pkg; do
+              echo mock > "packages/$f"
+          done
 
       # Read the pinned ports branch so it can be passed into the guest.
       - name: Read ports branch
@@ -159,6 +162,12 @@ jobs:
 
       - name: Extract tarballs into _site
         run: sh scripts/deploy/extract-artifacts.sh
+
+      # A Pages deployment replaces the whole site, so publishing a degraded
+      # set silently destroys the live repository -- which is how a terminated
+      # build once wiped it. Last gate before that becomes irreversible.
+      - name: Verify the package set before publishing
+        run: sh scripts/deploy/verify-site.sh
 
       - name: Generate landing page
         env:

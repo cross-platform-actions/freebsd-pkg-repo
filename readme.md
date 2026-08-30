@@ -222,6 +222,13 @@ work rather than trusting it:
   to the paths they will have on the target. `$SYSROOT/usr` *is* `/usr` there,
   so this is the standard sysroot-to-target translation — `libssh2.pc` records
   the directory cmake found OpenSSL in, and needs it.
+- Before anything is published, the assembled site is **verified as a usable
+  repository**: every `FreeBSD:<major>:<arch>` directory must have a non-empty
+  `packagesite.pkg` and `meta.conf`, at least one package, and a package for
+  every origin in `config/pkglist`. A Pages deployment replaces the whole site,
+  so publishing a degraded set destroys the live repository — which is exactly
+  how a terminated poudriere build once wiped it, because the old script
+  swallowed its own failures and still exited 0.
 - Every packaged file is then **grepped for the sysroot path**. Anything left
   is inside a binary — a `RUNPATH` or a compiled-in constant — which cannot be
   rewritten safely and is broken on the target, so it fails the build. When it

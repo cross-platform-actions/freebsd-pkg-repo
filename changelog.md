@@ -33,5 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (see the readme)
 - Build on pushes to any branch, so a change can be validated without
     publishing; only `master` deploys
+- Refuse to deploy an incomplete package set. A GitHub Pages deployment
+    replaces the whole site, so publishing a degraded set destroys the live
+    repository; the site is now checked for a usable `packagesite.pkg` and
+    `meta.conf` and a package for every origin in `config/pkglist` before
+    anything is published
 
 [Unreleased]: https://github.com/cross-platform-actions/freebsd-pkg-repo/commits/master

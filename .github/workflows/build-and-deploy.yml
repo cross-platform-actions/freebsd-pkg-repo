@@ -97,7 +97,7 @@ jobs:
       # architecture matrix.target_arch.
       - name: Cross-build packages on FreeBSD/amd64
         if: ${{ !inputs.mock_build }}
-        uses: cross-platform-actions/action@v1.3.0
+        uses: cross-platform-actions/action@v1.5.0
         env:
           TARGET_ARCH: ${{ matrix.target_arch }}
           RELEASE_MACHINE: ${{ matrix.release_machine }}
@@ -175,7 +175,7 @@ jobs:
           ls -l pkgrepo pkgrepo/All | head -30
 
       - name: Install and run the packages on FreeBSD/riscv64
-        uses: cross-platform-actions/action@v1.3.0
+        uses: cross-platform-actions/action@v1.5.0
         with:
           operating_system: freebsd
           architecture: riscv64

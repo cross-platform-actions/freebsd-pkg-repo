@@ -10,6 +10,10 @@ on:
         description: "Skip the VM build; generate fake packages to test the deploy path"
         type: boolean
         default: false
+      allow_package_drop:
+        description: "Permit a deploy that publishes fewer packages than are live"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -178,6 +182,14 @@ jobs:
 
       - name: Extract tarballs into _site
         run: sh scripts/deploy/extract-artifacts.sh
+
+      # Last gate before deploy-pages replaces the live site. Runs on the
+      # raw package tree, before the indexes below add index.html files.
+      - name: Refuse to shrink the published repository
+        env:
+          BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          ALLOW_PACKAGE_DROP: ${{ inputs.allow_package_drop }}
+        run: sh scripts/deploy/check-package-delta.sh
 
       - name: Generate landing page
         env:

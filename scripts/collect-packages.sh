@@ -54,7 +54,10 @@ ls -lR "$OUTPUT_DIR/"
 #
 # A partial set is allowed through: cumulative chunking means whatever
 # committed is dependency-complete, and publishing it beats publishing
-# nothing while later runs converge on the full set.
+# nothing while later runs converge on the full set. So this check catches
+# only a total loss -- a single committed package passes it. Refusing a set
+# that is merely smaller than what is already published needs to know what
+# is published, which is scripts/deploy/check-package-delta.sh's job.
 pkg_count=$(find "$OUTPUT_DIR/All" -name '*.pkg' -type f 2>/dev/null | wc -l | tr -d ' ')
 
 if [ "$pkg_count" -eq 0 ]; then

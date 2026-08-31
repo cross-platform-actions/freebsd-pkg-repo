@@ -41,3 +41,32 @@ done
 
 echo "=== Built packages ==="
 ls -lR "$OUTPUT_DIR/"
+
+# Refuse to hand an empty repository to the deploy job.
+#
+# poudriere publishes All/, Latest/ and the repo metadata as symlinks into
+# .latest/ only at the atomic commit that ends a bulk run. A run killed
+# mid-bulk commits nothing, so every copy above is skipped and OUTPUT_DIR is
+# left empty. Exiting non-zero fails the build step, which skips the
+# artifact upload and therefore the whole deploy job, leaving the published
+# repository untouched. Without this an empty packages/ deploys as a success
+# and wipes the live repository.
+#
+# A partial set is allowed through: cumulative chunking means whatever
+# committed is dependency-complete, and publishing it beats publishing
+# nothing while later runs converge on the full set.
+pkg_count=$(find "$OUTPUT_DIR/All" -name '*.pkg' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+if [ "$pkg_count" -eq 0 ]; then
+    echo "poudriere committed no packages -- refusing to deploy an empty repository." >&2
+    exit 1
+fi
+
+for required in meta.conf packagesite.pkg; do
+    if [ ! -e "$OUTPUT_DIR/$required" ]; then
+        echo "Missing repository metadata: $required -- refusing to deploy an unusable repository." >&2
+        exit 1
+    fi
+done
+
+echo "Collected $pkg_count package(s)."

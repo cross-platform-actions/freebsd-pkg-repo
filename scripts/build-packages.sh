@@ -46,6 +46,10 @@ sudo timeout -k 60 325m \
     || echo "poudriere bulk did not complete normally (exit $?)"
 
 # Step 5: Copy built packages to workspace for sync back to runner.
-# Runs unconditionally so partial progress is cached for the next run.
-sudo -E sh "$SCRIPT_DIR/collect-packages.sh" \
-    || echo "collect-packages.sh failed (exit $?)"
+#
+# The exit status is deliberately not swallowed. collect-packages.sh fails
+# when poudriere committed nothing, and that failure has to fail this step:
+# a failed build skips the artifact upload, which skips the deploy job, so
+# the published repository is left untouched. Swallowing it would let an
+# empty packages/ deploy as a success and wipe the live repository.
+sudo -E sh "$SCRIPT_DIR/collect-packages.sh"

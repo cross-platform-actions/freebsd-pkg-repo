@@ -98,11 +98,15 @@ jobs:
         with:
           operating_system: freebsd
           version: '15.0'
-          # Conservative values -- the runner has 4 vCPU / 16 GB, but pushing
-          # higher triggered OOM-style cascade failures across parallel
-          # builders (USE_TMPFS=wrkdir + ALLOW_MAKE_JOBS compound the pressure).
-          memory: 6G
-          cpu_count: 2
+          # Use the whole runner (4 vCPU / 16 GB), leaving 4 GB for the host.
+          # Pushing past 2 vCPU previously triggered OOM-style cascade
+          # failures because USE_TMPFS=wrkdir and an unbounded ALLOW_MAKE_JOBS
+          # compound across builders. config/poudriere.conf now caps
+          # PARALLEL_JOBS and MAKE_JOBS_NUMBER explicitly, which bounds that
+          # pressure -- and the emulated build needs the throughput: at
+          # 2 vCPU a cold build reached only 48 of 56 packages in 5h25m.
+          memory: 12G
+          cpu_count: 4
           shell: sh
           sync_files: true
           # Skip graceful VM shutdown -- files are already synced back before

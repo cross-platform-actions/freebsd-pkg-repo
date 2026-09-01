@@ -6,6 +6,11 @@
 #   QEMU_BINARY     - qemu-user-static binary name (e.g. qemu-riscv64-static)
 #   ELF_MAGIC       - ELF magic bytes in hex (no \x prefix, e.g. 7f454c46...)
 #   ELF_MASK        - ELF mask bytes in hex (no \x prefix, e.g. ffffffffffff...)
+#
+# Optional:
+#   QEMU_ARGS       - extra arguments appended to the interpreter
+#                     (e.g. "-cpu power9"). The kernel splits the
+#                     --interpreter string on spaces at exec time.
 
 set -eux
 
@@ -24,9 +29,10 @@ magic=$(hex_to_escaped "$ELF_MAGIC")
 mask=$(hex_to_escaped "$ELF_MASK")
 size=$((${#ELF_MAGIC} / 2))
 
-# Register the binary format
+# Register the binary format. QEMU_ARGS (if set) is appended to the
+# interpreter path; the kernel splits the resulting string on spaces.
 binmiscctl add "$BINMISCCTL_NAME" \
-    --interpreter "/usr/local/bin/$QEMU_BINARY" \
+    --interpreter "/usr/local/bin/$QEMU_BINARY${QEMU_ARGS:+ $QEMU_ARGS}" \
     --magic "$magic" \
     --mask "$mask" \
     --size "$size" \

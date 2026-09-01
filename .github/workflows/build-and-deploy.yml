@@ -207,3 +207,33 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+
+  # Keep a copy of what was just published, outside every store that
+  # expires. The cache is evicted after 7 days idle, artifacts after 90
+  # days, and a Pages deploy replaces the site wholesale -- when those
+  # lapsed together the repository had to be rebuilt from source.
+  archive:
+    name: Archive package set as a release
+    needs: deploy
+    runs-on: ubuntu-latest
+    # Narrower than the workflow default: this job publishes releases and
+    # has no business touching Pages.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: site-*
+
+      - name: Extract tarballs into _site
+        run: sh scripts/deploy/extract-artifacts.sh
+
+      - name: Publish snapshot release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/deploy/archive-release.sh

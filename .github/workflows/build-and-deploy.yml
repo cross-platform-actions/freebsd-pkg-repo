@@ -150,3 +150,43 @@ jobs:
             set -eux
             REPO_DIR="$PWD/pkgrepo" sh scripts/verify-packages.sh
 
+  # One release per architecture per distinct package set. Publishing is
+  # additive, so this is safe in a way the Pages deploy never was -- but it
+  # still waits on `verify`, because a release nobody can install from is worth
+  # no more than a Pages deploy nobody can install from.
+  #
+  # Only master publishes; a branch push builds and verifies without creating
+  # anything. Re-running on an unchanged set is a no-op: publish-release.sh
+  # fingerprints the package set and skips when it matches the newest release
+  # for that ABI, so repeated runs cannot spam releases.
+  publish:
+    name: Publish ${{ matrix.target_arch }} release
+    needs: [generate-matrix, build, verify]
+    if: ${{ github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download ${{ matrix.target_arch }} packages
+        uses: actions/download-artifact@v8
+        with:
+          name: packages-${{ matrix.build_name }}
+          path: pkgrepo
+
+      # ABI is passed as an assertion, not as configuration: the script reads
+      # the real ABI from the packages and fails if this disagrees, so it can
+      # catch a wrong call site but never cause one.
+      #
+      # GH_REPO because gh otherwise infers the repository from the working
+      # directory, and fails outside a checkout.
+      - name: Publish as a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ABI: FreeBSD:${{ matrix.major_version }}:${{ matrix.target_arch }}
+        run: sh scripts/deploy/publish-release.sh pkgrepo

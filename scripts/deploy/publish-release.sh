@@ -29,13 +29,23 @@
 #   ABI      - asserted against the ABI read from the packages. A mismatch
 #              is an error; it can catch a wrong call site but never cause
 #              one.
+#   ALLOW_PACKAGE_DROP - set to "true" to publish a set smaller than the
+#              previous release for this ABI, for a deliberate reduction.
 
 set -eu
 
 SRC="${1:?usage: publish-release.sh <repository-directory>}"
 : "${GH_TOKEN:?GH_TOKEN must be set}"
 
+# Validate the whole input up front. The ABI is read from packagesite.pkg
+# further down through a pipeline, and a pipeline reports the status of its
+# last command -- so a missing archive there yields an empty ABI and is
+# mistaken for a repository of nothing but architecture-independent
+# packages, rather than reported as the missing file it is.
 [ -d "$SRC/All" ] || { echo "$SRC has no All/ directory" >&2; exit 1; }
+for required in meta meta.conf data.pkg packagesite.pkg; do
+    [ -f "$SRC/$required" ] || { echo "$SRC has no $required" >&2; exit 1; }
+done
 
 WORK=$(mktemp -d)
 FLAT="$WORK/flat"
@@ -167,18 +177,52 @@ sha256sum < "$WORK/manifest.txt" | cut -d' ' -f1 > "$WORK/manifest.sha256"
 fingerprint=$(cat "$WORK/manifest.sha256")
 cp "$WORK/manifest.txt" "$WORK/manifest.sha256" "$FLAT/"
 
-# One release per distinct package set: an unchanged rebuild is a no-op
-# rather than either a duplicate release or a mutated one.
+# Everything below compares against the newest existing release for this
+# ABI. Both checks read assets that release published about itself, so a
+# release predating either of them simply does not participate.
 previous=$(gh release list --limit 100 --json tagName,createdAt \
     --jq "[.[] | select(.tagName | startswith(\"${tag_base}--\"))]
           | sort_by(.createdAt) | reverse | .[0].tagName // empty") || previous=''
 
+prev_fingerprint=''
+prev_count=''
 if [ -n "$previous" ]; then
     if gh release download "$previous" --pattern manifest.sha256 \
-           --dir "$WORK/prev" >/dev/null 2>&1 &&
-       [ "$(cat "$WORK/prev/manifest.sha256" 2>/dev/null)" = "$fingerprint" ]; then
-        echo "$abi: identical to $previous ($count packages); nothing to publish"
-        exit 0
+           --dir "$WORK/prev" >/dev/null 2>&1; then
+        prev_fingerprint=$(cat "$WORK/prev/manifest.sha256")
+    fi
+    if gh release download "$previous" --pattern manifest.txt \
+           --dir "$WORK/prev" >/dev/null 2>&1; then
+        prev_count=$(wc -l < "$WORK/prev/manifest.txt" | tr -d ' ')
+    fi
+fi
+
+# One release per distinct package set: an unchanged rebuild is a no-op
+# rather than either a duplicate release or a mutated one.
+if [ -n "$prev_fingerprint" ] && [ "$prev_fingerprint" = "$fingerprint" ]; then
+    echo "$abi: identical to $previous ($count packages); nothing to publish"
+    exit 0
+fi
+
+# Refuse to publish a set smaller than the one before it.
+#
+# Publishing here is additive -- the previous release stays fetchable at its
+# tag whatever this one contains -- so a shrunken set destroys nothing, and
+# this is a correctness check rather than a safety one. It earns its place
+# because the guard upstream of it verifies a package for every origin in
+# config/pkglist, which is a handful of leaf ports; the dependency closure
+# around them is several times larger and entirely unchecked. A build that
+# silently loses dependency packages satisfies every origin and still
+# produces a repository that cannot resolve an install.
+if [ -n "$prev_count" ] && [ "$count" -lt "$prev_count" ]; then
+    lost=$((prev_count - count))
+    if [ "${ALLOW_PACKAGE_DROP:-false}" = true ]; then
+        echo "$abi: $lost fewer package(s) than $previous; allowed by ALLOW_PACKAGE_DROP" >&2
+    else
+        echo "$abi: refusing to publish $count packages when $previous has $prev_count" >&2
+        echo "  $lost package(s) would be missing from the newest release." >&2
+        echo "  Set ALLOW_PACKAGE_DROP=true if the reduction is intended." >&2
+        exit 1
     fi
 fi
 

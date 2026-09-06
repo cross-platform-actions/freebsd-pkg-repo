@@ -109,3 +109,44 @@ jobs:
         with:
           name: packages-${{ matrix.build_name }}
           path: packages
+
+  # Everything in `build` proves the packages were assembled correctly. Only
+  # this proves they RUN. riscv64 is the only target with a published guest
+  # image (there is no powerpc64 one -- much of why its packages are wanted),
+  # and both are produced by the identical pipeline, so a pass here is strong
+  # evidence for powerpc64 without being proof of it.
+  #
+  # The guest is emulated: riscv64 on an x86-64 runner gets no KVM, so this is
+  # slow in a way the cross-build itself deliberately is not. It only installs
+  # packages and runs them, so slow is affordable.
+  verify:
+    name: Verify riscv64 packages on a real target
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download riscv64 packages
+        uses: actions/download-artifact@v8
+        with:
+          name: packages-riscv64-150
+          path: pkgrepo
+
+      - name: Install and run the packages on FreeBSD/riscv64
+        uses: cross-platform-actions/action@v1.5.0
+        with:
+          operating_system: freebsd
+          architecture: riscv64
+          version: '15.0'
+          memory: 4G
+          cpu_count: 2
+          shell: sh
+          # REPO_DIR is resolved inside the guest rather than forwarded: the
+          # working directory maps to GITHUB_WORKSPACE, but its path there is
+          # not the runner's.
+          run: |
+            set -eux
+            REPO_DIR="$PWD/pkgrepo" sh scripts/verify-packages.sh
+

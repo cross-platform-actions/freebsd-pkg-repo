@@ -1,1 +1,12 @@
-riscv.riscv64 riscv64 qemu-riscv64-static 7f454c460201010000000000000000000200f300 ffffffffffffff00fffffffffffffffffeffffff
+# One target architecture per line:
+#
+#   <target_arch> <release_machine>
+#
+# target_arch     pkg ABI architecture and ports ARCH (e.g. powerpc64)
+# release_machine the MACHINE component of the release path on
+#                 download.freebsd.org, i.e.
+#                 releases/<release_machine>/<target_arch>/<version>-RELEASE/
+#
+# Lines starting with '#' and blank lines are ignored.
+riscv64 riscv
+powerpc64 powerpc
